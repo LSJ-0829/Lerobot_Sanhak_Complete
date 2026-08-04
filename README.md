@@ -69,8 +69,9 @@ bash tools/setup_demo_machine.sh
 # 0) 로봇을 움직이지 않고 연결·장비만 점검 — 항상 이것부터
 python scripts/skills/laundry_task4.py --check
 
-# 1) 전체 실행 (첫 실전은 --pause 로 단계 사이를 끊고, --csi-idle 로 SO101 을 대기시키는 걸 권함)
-python scripts/skills/laundry_task4.py --csi-idle --pause
+# 1) 전체 실행. Enter 는 한 번뿐이고 그 앞에서 모든 로딩이 끝난다
+#    (첫 실전은 --pause 로 단계 사이를 한 번 더 끊는 걸 권함)
+python scripts/skills/laundry_task4.py --pause
 
 # 2) LeKiwi 는 이미 끝났고 수건개기만
 python scripts/skills/laundry_task4.py --skip-task3
@@ -120,9 +121,25 @@ nmcli device status             # enx… 가 disconnected 인지 확인
 3. **전달 모션.** `--handoff-motion <이름>`(`motions/<이름>.json`) 을 주면 마지막 후퇴 *뒤에*
    재생한다. 안 주면 생략한다.
 
-4. **원격 트리거.** `clothing/` 을 CWD 로 두고 `scripts/rollout_auto.py --immediate_start` 를
-   실행한다. task3 가 exit 0 이면 수건이 이미 전달된 상태이므로 IDLE 을 건너뛴다.
-   `--csi-idle` 을 주면 classifier 가 수건을 인식할 때까지 기다린다(팔이 안 움직여 더 안전).
+4. **수건개기 시작 조건.** `clothing/` 을 CWD 로 두고 `scripts/rollout_auto.py --no_step0` 을 돌린다.
+   무거운 로딩은 첫 Enter 앞에서 이미 끝나 있고(prewarm), 프로세스는 IDLE 에서 대기하다가
+   **top 카메라 classifier 가 '펴져 있음'을 인식하면 접기(step1)부터** 시작한다.
+
+   step0(펼치기)는 정책이 불완전해 기본으로 제외한다(`--no_step0`). 그러면 rollout 의
+   `start_step` 이 2 가 되어 IDLE 탈출 후보가 class 2~3 으로 좁혀진다 — 뭉쳐 있는 상태(class 1)로는
+   시작하지 않고, 펴진 상태가 잡힐 때까지 기다린다.
+
+   | 조건 | 값 |
+   |---|---|
+   | 후보 클래스 | class 2~3 (`--no_step0` 기준. step0 포함 시 1~2) |
+   | 최소 확률 | 최근 15프레임 평균 ≥ 0.20 |
+   | 유지 시간 | 확신도 0.6 → 5.0s, 1.0 → 1.0s (선형보간) |
+   | 팔 움직임 배수 | idle 자세에서 0.05 rad 이상 벗어나거나 움직이면 최대 3.5배 |
+
+   ⚠️ `--no_step0` 이면 stall 복구 2단계에서 step0 로 되돌아가지 못하므로, 접기가 두 번 막히면
+   rollout 이 **종료**된다(step0 가 있으면 펼치기로 복구를 시도한다).
+
+   ⚠️ 수건이 **top 카메라 시야(접는 판) 안에** 떨어져야 한다. 판 밖이면 계속 IDLE 이다.
 
 ## 본체마다 다른 값 (⚠️ 옮길 때 반드시 확인)
 
@@ -165,9 +182,10 @@ csi-agent 의 `99-lerobot.rules` 는 top 카메라(`camera_0`)를 모델 문자�
 |---|---|
 | `--check` | 로봇을 움직이지 않고 preflight 만 |
 | `--wireless` | Jetson 무선(`192.168.0.19`). 없으면 유선 |
-| `--pause` | task3 종료 후 Enter 를 눌러야 SO101 시작 |
-| `--csi-idle` | SO101 을 IDLE 에서 classifier 판단까지 대기 |
-| `--csi-no-step0` | step0(펼치기) 없이 step1 부터 |
+| `--pause` | task3 종료 후 Enter 를 한 번 더 받는다(기본은 Enter 한 번뿐) |
+| `--csi-with-step0` | step0(펼치기)까지 포함(기본은 제외) |
+| `--csi-immediate` | classifier 대기 없이 즉시 시작(`--no-prewarm` 과 함께) |
+| `--no-prewarm` | 수건개기 모델을 미리 안 올림(=로딩 스톨 생김) |
 | `--skip-task3` / `--skip-csi` | 한쪽 단계만 |
 | `--record` | front/wrist/상공 프레임 녹화 → `runs/<ts>/` + mp4 |
 

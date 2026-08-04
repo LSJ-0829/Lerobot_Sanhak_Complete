@@ -66,10 +66,11 @@ REPO = Path(__file__).resolve().parents[2]  # ~/lerobot
 CSI_HOST = os.environ.get("CSI_HOST", "lerobot@115.145.179.95")  # ~/.ssh/config 별칭 'so101' 도 가능
 CSI_DIR = os.environ.get("CSI_DIR", "/home/lerobot/lerobot2/csi-agent/lhwdev")
 CSI_PYTHON = os.environ.get("CSI_PYTHON", "/home/lerobot/miniconda3/envs/lerobot/bin/python")
-# rollout_auto.py 는 기본적으로 IDLE 에서 classifier 가 '시작해도 되는 상태'라고 판단할 때까지 기다린다.
-# 우리는 task3 가 exit 0(집기 확정 + 전달까지 완료)일 때만 여기 오므로 --immediate_start 로 바로 시작한다.
-# 기다렸다 시작하게 하려면 --csi-idle (이러면 수건이 보일 때까지 팔이 안 움직여서 더 안전하다).
-CSI_CMD = os.environ.get("CSI_CMD", "scripts/rollout_auto.py --immediate_start")
+# 기본은 --no_step0 = step0(펼치기)를 빼고 step1(접기)부터. step0 정책이 아직 불완전해서다.
+# 이러면 classifier 의 IDLE 탈출 후보가 class 2~3 으로 좁혀져서(rollout.py: start_step = 2),
+# '수건이 펴져 있다'고 인식될 때까지 IDLE 에서 기다렸다가 접기부터 시작한다.
+# 펼치기 단계를 되살리려면 --csi-with-step0.
+CSI_CMD = os.environ.get("CSI_CMD", "scripts/rollout_auto.py --no_step0")
 CSI_ENV = os.environ.get("CSI_ENV", "")                        # 예: "DISPLAY=:0 CUDA_VISIBLE_DEVICES=0"
 
 # 로컬 LeKiwi 쪽 — ⚠️ 아래 두 값은 '본체마다 다르다'. 다른 PC 로 옮기면 반드시 다시 확인할 것.
@@ -380,11 +381,12 @@ def main():
     ap.add_argument("--csi-dir", default=CSI_DIR, help="원격 csi-agent 저장소 경로 (기본 ~/csi-agent)")
     ap.add_argument("--csi-python", default=CSI_PYTHON, help="원격 파이썬 (기본 conda lerobot env)")
     ap.add_argument("--csi-cmd", default=CSI_CMD,
-                    help="clothing/ 기준 실행 커맨드 (기본 rollout_auto.py --immediate_start)")
-    ap.add_argument("--csi-idle", action="store_true",
-                    help="--immediate_start 를 빼고 IDLE 에서 classifier 판단을 기다리게 한다(더 안전)")
-    ap.add_argument("--csi-no-step0", action="store_true",
-                    help="step0(펼치기) 정책 없이 step1 부터 실행(rollout_auto --no_step0)")
+                    help="clothing/ 기준 실행 커맨드 (기본 rollout_auto.py --no_step0)")
+    ap.add_argument("--csi-with-step0", action="store_true",
+                    help="step0(펼치기)까지 포함. 기본은 --no_step0 — step0 정책이 불완전해 제외하고, "
+                         "'펴져 있음'이 인식될 때까지 IDLE 에서 기다렸다 접기(step1)부터 시작한다")
+    ap.add_argument("--csi-immediate", action="store_true",
+                    help="classifier 대기 없이 즉시 접기 시작(--immediate_start). prewarm 과 같이 못 쓴다")
     ap.add_argument("--csi-env", default=CSI_ENV, help='원격 export 할 env (예: "DISPLAY=:0")')
     ap.add_argument("--task3", type=Path, default=DEFAULT_TASK3, help="실행할 laundry_task3.py 경로")
     ap.add_argument("--overhead-cam", default=OVERHEAD_CAM,
@@ -426,13 +428,18 @@ def main():
                   "원격으로 강제하려면 --csi-host 를 명시하세요.")
             args.csi_host = "local"
 
-    # 원격 rollout 플래그 조정.
-    # prewarm 이 켜져 있으면(기본) IDLE 이 강제된다 — 미리 띄우는 이상 --immediate_start 를 쓰면
-    # 수건이 도착하기도 전에 팔이 움직인다. 대신 로딩이 전부 첫 Enter 앞에서 끝난다.
-    if args.csi_idle or (args.prewarm and not args.skip_csi and not args.skip_task3):
+    # 원격 rollout 플래그 조정
+    if args.csi_with_step0:
+        args.csi_cmd = args.csi_cmd.replace("--no_step0", "").strip()
+    if args.csi_immediate and "--immediate_start" not in args.csi_cmd:
+        args.csi_cmd += " --immediate_start"
+    # prewarm 이 켜져 있으면(기본) 즉시시작은 성립하지 않는다 — 미리 띄우는 이상
+    # --immediate_start 는 수건이 도착하기도 전에 팔을 움직인다. IDLE 대기를 강제한다.
+    if args.prewarm and not args.skip_csi and not args.skip_task3:
+        if "--immediate_start" in args.csi_cmd:
+            print("  ℹ️ prewarm 과 --csi-immediate 는 같이 못 씁니다 → IDLE 대기로 진행 "
+                  "(즉시 시작하려면 --no-prewarm 을 함께 주세요)")
         args.csi_cmd = args.csi_cmd.replace("--immediate_start", "").strip()
-    if args.csi_no_step0 and "--no_step0" not in args.csi_cmd:
-        args.csi_cmd += " --no_step0"
 
     if not args.task3.exists():
         print(f"✗ task3 스크립트 없음: {args.task3}")
