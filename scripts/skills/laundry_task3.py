@@ -89,6 +89,8 @@ THETA_CW = float(os.environ.get("THETA_CW", "-1"))    # theta.vel 부호: 시계
 STEP = float(os.environ.get("STEP", "0.15"))          # approach 펄스 단위(초)
 # approach
 APPROACH_TIMEOUT = float(os.environ.get("APPROACH_TIMEOUT", "40"))
+# 전후진 허용오차(px). 4 는 너무 빡빡해서 한 STEP 이 그보다 크게 움직이면 영원히 진동한다.
+APPROACH_Y_TOL = float(os.environ.get("APPROACH_Y_TOL", "8"))
 # 문열기 base 이동 시간(초) — 직접버스 기본과 같은 값, 속도가 달라 재보정 필요
 OPEN_STRAFE_SEC = float(os.environ.get("OPEN_STRAFE_SEC", "0.5"))    # 오른쪽 정렬
 OPEN_FORWARD_SEC = float(os.environ.get("OPEN_FORWARD_SEC", "0.7"))  # 손잡이쪽 전진
@@ -197,35 +199,88 @@ def detect_blob(frame_bgr, ranges, min_area):
     return int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]), area
 
 
-def approach(robot, cal, y_tol=4, rec=None, ohcap=None, gui_win=None):
-    """front(obs) 빨간블롭을 strafe 로 중심 맞추고 전후진으로 target_y 까지 접근."""
-    print("[approach] 빨간 손잡이 접근 (front, strafe 정렬 + 전후진)")
+def approach(robot, cal, y_tol=None, rec=None, ohcap=None, gui_win=None):
+    """front(obs) 빨간블롭을 strafe 로 중심 맞추고 전후진으로 target_y 까지 접근.
+
+    진행 상황을 주기적으로 찍는다. 예전엔 40초간 아무 것도 안 찍고 '타임아웃'만 나와서,
+    무엇이 잘못됐는지(못 찾는 건지 / 엉뚱한 방향으로 가는 건지) 알 수가 없었다.
+    """
+    y_tol = APPROACH_Y_TOL if y_tol is None else y_tol
+    cx0_cfg = cal["center_x"]
+    print(f"[approach] 빨간 손잡이 접근 — 목표 cx={cx0_cfg} cy={cal['target_y']} "
+          f"(허용 x±{cal['dead_x']} y±{y_tol}), 최대 {APPROACH_TIMEOUT}s")
     deadline = time.time() + APPROACH_TIMEOUT
+    last_log = 0.0
+    first = None       # 처음 관측한 (cx, cy) — 방향이 맞는지 판단용
+    last = None
+    n_miss = 0
     while time.time() < deadline:
         obs = robot.get_observation()
         fr = obs.get("front")
         if not isinstance(fr, np.ndarray):
             time.sleep(0.05); continue
         bgr = cv2.cvtColor(fr, cv2.COLOR_RGB2BGR)
-        cx0 = cal["center_x"] if cal["center_x"] is not None else bgr.shape[1] // 2
+        cx0 = cx0_cfg if cx0_cfg is not None else bgr.shape[1] // 2
         cx, cy, area = detect_blob(bgr, cal["ranges"], cal["min_area"])
         if rec is not None:
             rec.add(obs, (ohcap.read()[1] if ohcap else None))
         if gui_win:
-            cv2.imshow(gui_win, cv2.resize(bgr, (480, 360)));
+            cv2.imshow(gui_win, cv2.resize(bgr, (480, 360)))
             if (cv2.waitKey(1) & 0xFF) in (ord("q"), 27):
                 print("[approach] abort"); return False
         if cx is None:
+            n_miss += 1
+            if time.time() - last_log > 1.5:
+                print(f"[approach] 손잡이 미검출 ({n_miss}회) — 시야에 없거나 HSV/조명 문제")
+                last_log = time.time()
             _stop(robot); time.sleep(0.05); continue
+
+        last = (cx, cy)
+        if first is None:
+            first = (cx, cy)
+        dx, dy = cx - cx0, cy - cal["target_y"]
+
         # 1) 좌우 정렬(strafe)
-        if abs(cx - cx0) > cal["dead_x"]:
+        if abs(dx) > cal["dead_x"]:
+            act = f"strafe {'오른쪽' if dx > 0 else '왼쪽'}"
+            if time.time() - last_log > 1.5:
+                print(f"[approach] cx={cx}(목표 {cx0}, 차이 {dx:+d}) cy={cy} area={int(area)} → {act}")
+                last_log = time.time()
             strafe(robot, -1 if cx < cx0 else +1, STEP)
             continue
         # 2) 전후진
-        if abs(cy - cal["target_y"]) <= y_tol:
-            _stop(robot); print(f"[approach] 도착 cy={cy}(target {cal['target_y']})"); return True
+        if abs(dy) <= y_tol:
+            _stop(robot)
+            print(f"[approach] ✅ 도착 cx={cx}(목표 {cx0}) cy={cy}(목표 {cal['target_y']}) area={int(area)}")
+            return True
+        act = f"{'전진' if dy > 0 else '후진'}"
+        if time.time() - last_log > 1.5:
+            print(f"[approach] cx={cx}✓ cy={cy}(목표 {cal['target_y']}, 차이 {dy:+d}) area={int(area)} → {act}")
+            last_log = time.time()
         fwd(robot, +1 if cy > cal["target_y"] else -1, STEP)
-    print("[approach] ⚠️ 타임아웃"); _stop(robot); return False
+
+    _stop(robot)
+    print(f"[approach] ⚠️ 타임아웃({APPROACH_TIMEOUT}s)")
+    if last is None:
+        print("[approach]   손잡이를 한 번도 못 찾았다 → 로봇이 세탁기를 안 보고 있거나 HSV/조명 문제.")
+        print("[approach]   tools/stream_front.py 로 화면을 확인할 것.")
+    else:
+        print(f"[approach]   마지막 cx={last[0]}(목표 {cx0_cfg}) cy={last[1]}(목표 {cal['target_y']})")
+        if first is not None:
+            moved = (abs(first[0] - last[0]), abs(first[1] - last[1]))
+            if max(moved) < 5:
+                print("[approach]   시작과 끝의 좌표가 거의 같다 → 바퀴가 안 움직이는 것으로 보인다"
+                      " (ZMQ base 명령/모터 확인).")
+            else:
+                near_x = abs(last[0] - (cx0_cfg or 0))
+                near_x0 = abs(first[0] - (cx0_cfg or 0))
+                if near_x > near_x0:
+                    print("[approach]   목표에서 오히려 멀어졌다 → 이동 방향 부호가 반대다"
+                          " (Y_RIGHT 또는 V_FWD 부호를 뒤집을 것).")
+                else:
+                    print("[approach]   접근은 하는데 시간이 부족했다 → APPROACH_TIMEOUT 을 늘리거나"
+                          " STEP/V_FWD 를 키울 것.")
+    return False
 
 
 # ─────────────────────── 문열기(open_door2 포팅) ───────────────────────

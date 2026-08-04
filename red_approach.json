@@ -1,9 +1,9 @@
 {
   "_comment": "approach_then_center_black.py 1단계(세탁기 빨간 손잡이 접근) 파라미터. 재학습/조정 시 이 파일만 수정하면 됨(스크립트 수정 불필요).",
-  "_measured": "2026-06-30 재학습(calibrate_red.py, 60프레임): area median=3536[3415~3717], cx=282, cy=22",
-  "TARGET_Y": 22,
-  "AREA_THRESHOLD": 3182,
-  "CENTER_X": 282,
+  "_measured": "2026-08-04 재측정(시연 본체, 도착 위치에서 80프레임): cx=346, cy=17, area median=2466 (cx/cy 표준편차 0.0). 경로=lerobot obs['front'] 경유, front=640x480 NO_ROTATION. 이전 값(2026-06-30, cx=282 cy=22 area=3536)은 Jetson 직접 cv2 캡처로 측정한 것.",
+  "TARGET_Y": 17,
+  "AREA_THRESHOLD": 2219,
+  "CENTER_X": 346,
   "DEAD_ZONE_X": 50,
   "DETECT_AREA_MIN": 300,
   "WHEEL_SPEED": 600,
