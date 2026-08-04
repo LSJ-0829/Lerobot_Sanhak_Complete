@@ -105,13 +105,19 @@ V_APPROACH_Y = float(os.environ.get("V_APPROACH_Y", "0.05"))  # 전후진 최대
 V_APPROACH_MIN = float(os.environ.get("V_APPROACH_MIN", "0.03"))  # 이보다 느리면 모터가 안 돈다
 # 이 오차(px)에서 최대 속도. 그보다 작으면 비례해서 느려진다.
 APPROACH_FULL_PX = float(os.environ.get("APPROACH_FULL_PX", "80"))
-# 실측(2026-08-04, 시연 본체): y.vel=+0.08 을 0.5초 주면 화면상 cx 가 +41px 커진다.
-# 즉 cx 를 '줄이려면' y.vel 은 음수여야 한다. 배치가 바뀌어 반대가 되면 -1 로 뒤집는다.
-Y_VEL_TO_CX = float(os.environ.get("Y_VEL_TO_CX", "-1"))
+# ⚠️ Y_RIGHT 와 혼동하지 말 것. Y_RIGHT 는 '물리적으로 어느 쪽이 오른쪽인가'(-1),
+# 이건 '화면상 cx 와 y.vel 의 부호 관계'다. 둘은 별개이고 값도 다르다.
+# 실측(2026-08-04, 시연 본체): y.vel=+0.08 을 0.5초 주면 화면상 cx 가 +41px 커진다 → +1.
+# 따라서 cx 를 줄이려면 y.vel 은 음수. (한 번 -1 로 뒤집었다가 실기에서 발산해 되돌렸다:
+#  cx 396→463→563→630 으로 커지며 손잡이가 시야를 벗어났다.)
+Y_VEL_TO_CX = float(os.environ.get("Y_VEL_TO_CX", "+1"))
 # 실측: x.vel=+0.10 전진 시 cy 가 -11px 작아진다 → cy 를 줄이려면 x.vel 은 양수.
 X_VEL_TO_CY = float(os.environ.get("X_VEL_TO_CY", "-1"))
 # 전후진 허용오차(px). 4 는 너무 빡빡해서 한 STEP 이 그보다 크게 움직이면 영원히 진동한다.
 APPROACH_Y_TOL = float(os.environ.get("APPROACH_Y_TOL", "8"))
+# 발산 감지: 최선 오차보다 이만큼(px) 더 나빠진 상태가 이 시간(초) 이상 지속되면 중단한다.
+DIVERGE_PX = float(os.environ.get("DIVERGE_PX", "60"))
+DIVERGE_SEC = float(os.environ.get("DIVERGE_SEC", "1.5"))
 # 문열기 base 이동 시간(초) — 직접버스 기본과 같은 값, 속도가 달라 재보정 필요
 OPEN_STRAFE_SEC = float(os.environ.get("OPEN_STRAFE_SEC", "0.5"))    # 오른쪽 정렬
 OPEN_FORWARD_SEC = float(os.environ.get("OPEN_FORWARD_SEC", "0.7"))  # 손잡이쪽 전진
@@ -276,6 +282,7 @@ def approach(robot, cal, y_tol=None, rec=None, ohcap=None, gui_win=None):
     first = None       # 처음 관측한 (cx, cy) — 방향이 맞는지 판단용
     last = None
     n_miss = 0
+    best_err, best_t = float("inf"), time.time()   # 발산 감지용
     while time.time() < deadline:
         obs = robot.get_observation()
         fr = obs.get("front")
@@ -305,6 +312,19 @@ def approach(robot, cal, y_tol=None, rec=None, ohcap=None, gui_win=None):
         if first is None:
             first = (cx, cy)
         dx, dy = cx - cx0, cy - cal["target_y"]
+
+        # 발산 감지 — 부호가 반대면 로봇이 목표에서 멀어지며 손잡이가 시야를 벗어날 때까지
+        # 계속 달려간다(2026-08-04 두 번 발생). 최선값보다 크게 나빠지면 즉시 멈춘다.
+        err = abs(dx) + abs(dy)
+        if err < best_err:
+            best_err, best_t = err, time.time()
+        elif err > best_err + DIVERGE_PX and time.time() - best_t > DIVERGE_SEC:
+            _stop(robot, arm)
+            print(f"[approach] ✗ 발산 감지 — 오차가 최선 {best_err:.0f}px 에서 {err:.0f}px 로 벌어졌다.")
+            print(f"[approach]   cx={cx}(목표 {cx0}) cy={cy}(목표 {cal['target_y']})")
+            print("[approach]   이동 방향 부호가 반대다. 화면상 cx 가 커지는 쪽으로 가고 있으면")
+            print("[approach]   Y_VEL_TO_CX 를, cy 쪽이면 X_VEL_TO_CY 를 뒤집을 것.")
+            return False
 
         # 두 축을 '동시에', '연속으로' 제어한다. 예전처럼 펄스를 주고 멈추기를 반복하면
         # 휙휙 끊겨 보인다. 매 주기 오차에 비례한 속도를 갱신해 보내면 부드럽게 수렴한다.
