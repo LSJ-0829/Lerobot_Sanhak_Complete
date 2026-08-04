@@ -86,9 +86,16 @@ V_STRAFE = float(os.environ.get("V_STRAFE", "0.12"))  # 좌우 strafe 속도 m/s
 V_ROT = float(os.environ.get("V_ROT", "0.6"))         # 회전 속도 rad/s
 Y_RIGHT = float(os.environ.get("Y_RIGHT", "1"))       # y.vel 부호: +값이 '오른쪽'이면 1
 THETA_CW = float(os.environ.get("THETA_CW", "-1"))    # theta.vel 부호: 시계(우)회전이 음수면 -1
-STEP = float(os.environ.get("STEP", "0.15"))          # approach 펄스 단위(초)
+STEP = float(os.environ.get("STEP", "0.15"))          # approach 펄스 최대 길이(초)
 # approach
 APPROACH_TIMEOUT = float(os.environ.get("APPROACH_TIMEOUT", "40"))
+# approach 전용 저속. V_FWD/V_STRAFE 를 낮추면 [7] 복귀 주행처럼 '시간 기반' 이동거리가 같이
+# 줄어들기 때문에 여기서만 따로 쓴다(V_FWD=0.15 로 한 펄스가 약 2cm 라 목표 근처에서 튄다).
+V_APPROACH = float(os.environ.get("V_APPROACH", "0.08"))
+V_APPROACH_Y = float(os.environ.get("V_APPROACH_Y", "0.07"))
+# 오차 비례 펄스: 오차가 FULL_PX 이상이면 STEP 전체, 가까워질수록 짧아져 STEP_MIN 까지 준다.
+STEP_MIN = float(os.environ.get("STEP_MIN", "0.04"))
+APPROACH_FULL_PX = float(os.environ.get("APPROACH_FULL_PX", "80"))
 # 전후진 허용오차(px). 4 는 너무 빡빡해서 한 STEP 이 그보다 크게 움직이면 영원히 진동한다.
 APPROACH_Y_TOL = float(os.environ.get("APPROACH_Y_TOL", "8"))
 # 문열기 base 이동 시간(초) — 직접버스 기본과 같은 값, 속도가 달라 재보정 필요
@@ -169,6 +176,12 @@ def rotate(robot, clockwise, seconds, **kw):  # True=시계(우)
     move_base(robot, theta=w, seconds=seconds, **kw)
 
 
+def _pulse(err_px):
+    """오차(px)에 비례한 펄스 길이(초). 목표에 가까울수록 짧게 → 오버슈트 방지."""
+    frac = min(1.0, abs(err_px) / max(1.0, APPROACH_FULL_PX))
+    return max(STEP_MIN, STEP * frac)
+
+
 def replay_motion(robot, name, rec=None, ohcap=None):
     """motions/<name>.json(raw frames) 을 ZMQ 로 재생(정규화 액션 순차 전송)."""
     path = REPO / "motions" / f"{name}.json"
@@ -235,6 +248,8 @@ def approach(robot, cal, y_tol=None, rec=None, ohcap=None, gui_win=None):
     cx0_cfg = cal["center_x"]
     print(f"[approach] 빨간 손잡이 접근 — 목표 cx={cx0_cfg} cy={cal['target_y']} "
           f"(허용 x±{cal['dead_x']} y±{y_tol}), 최대 {APPROACH_TIMEOUT}s")
+    print(f"[approach] 저속 {V_APPROACH}/{V_APPROACH_Y} m/s, 펄스 {STEP_MIN}~{STEP}s "
+          f"(오차 {APPROACH_FULL_PX}px 이상이면 최대) → 한 펄스 약 0.2~0.9cm")
     deadline = time.time() + APPROACH_TIMEOUT
     last_log = 0.0
     first = None       # 처음 관측한 (cx, cy) — 방향이 맞는지 판단용
@@ -270,24 +285,28 @@ def approach(robot, cal, y_tol=None, rec=None, ohcap=None, gui_win=None):
             first = (cx, cy)
         dx, dy = cx - cx0, cy - cal["target_y"]
 
-        # 1) 좌우 정렬(strafe)
+        # 1) 좌우 정렬(strafe) — 오차에 비례한 짧은 펄스
         if abs(dx) > cal["dead_x"]:
-            act = f"strafe {'오른쪽' if dx > 0 else '왼쪽'}"
+            p = _pulse(dx)
+            act = f"strafe {'오른쪽' if dx > 0 else '왼쪽'} {p:.2f}s"
             if time.time() - last_log > 1.5:
                 print(f"[approach] cx={cx}(목표 {cx0}, 차이 {dx:+d}) cy={cy} area={int(area)} → {act}")
                 last_log = time.time()
-            strafe(robot, -1 if cx < cx0 else +1, STEP, arm=arm)
+            move_base(robot, y=(-1 if cx < cx0 else +1) * Y_RIGHT * V_APPROACH,
+                      seconds=p, arm=arm)
             continue
         # 2) 전후진
         if abs(dy) <= y_tol:
             _stop(robot, arm)
             print(f"[approach] ✅ 도착 cx={cx}(목표 {cx0}) cy={cy}(목표 {cal['target_y']}) area={int(area)}")
             return True
-        act = f"{'전진' if dy > 0 else '후진'}"
+        p = _pulse(dy)
+        act = f"{'전진' if dy > 0 else '후진'} {p:.2f}s"
         if time.time() - last_log > 1.5:
             print(f"[approach] cx={cx}✓ cy={cy}(목표 {cal['target_y']}, 차이 {dy:+d}) area={int(area)} → {act}")
             last_log = time.time()
-        fwd(robot, +1 if cy > cal["target_y"] else -1, STEP, arm=arm)
+        move_base(robot, x=(+1 if cy > cal["target_y"] else -1) * V_APPROACH_Y,
+                  seconds=p, arm=arm)
 
     _stop(robot)
     print(f"[approach] ⚠️ 타임아웃({APPROACH_TIMEOUT}s)")
