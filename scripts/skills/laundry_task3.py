@@ -546,6 +546,6 @@ def main():
 
 if __name__ == "__main__":
     with torch.inference_mode():
-        # 종료코드로 성공/실패를 알린다(laundry_pipeline.py 가 이 값으로 다음 단계 진행 여부를 결정).
+        # 종료코드로 성공/실패를 알린다(laundry_task4.py 가 이 값으로 다음 단계 진행 여부를 결정).
         # 0=성공 3=approach 4=문열기 5=abort 6=throw 7=전달모션 130=Ctrl+C
         sys.exit(main() or 0)

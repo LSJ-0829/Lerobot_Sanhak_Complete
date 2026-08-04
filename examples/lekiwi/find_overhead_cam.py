@@ -99,10 +99,15 @@ def candidates(match=""):
     return out
 
 
+# udev 로 고정해 둔 이름들. 리그에 카메라가 여러 대면 자동 탐색이 엉뚱한 걸 고를 수 있으므로
+# 이게 있으면 항상 먼저 쓴다(tools/99-lekiwi-overhead.rules 가 만든다).
+WELL_KNOWN = ("/dev/lerobot/overhead", "/dev/lekiwi/overhead")
+
+
 def resolve_overhead_cam(spec="auto", match="", verbose=True):
     """상공 카메라 경로를 확정한다.
 
-    spec 이 'auto' 가 아니고 그 경로가 실제로 열리면 그대로 쓴다. 아니면 USB 후보를 훑는다.
+    우선순위: 명시 경로 → udev 고정 이름(/dev/lerobot/overhead) → USB 자동 탐색.
     반환: (경로 or None, 안내 메시지 리스트)
     """
     log = []
@@ -112,7 +117,17 @@ def resolve_overhead_cam(spec="auto", match="", verbose=True):
             return spec, log
         log.append(f"지정 경로 {spec} 를 못 씀(없거나 프레임 안 나옴) → 자동 탐색으로 전환")
 
+    for wk in WELL_KNOWN:
+        if os.path.exists(wk) and probe(wk):
+            log.append(f"udev 고정 이름 사용: {wk} → {os.path.realpath(wk)}")
+            return wk, log
+
     cands = candidates(match)
+    if len(cands) > 2 and not match:
+        # 리그에 카메라가 여러 대다(예: SO101 top/left/right + 상공). 자동 탐색은 '프레임이
+        # 나오는 첫 번째'를 고르므로 엉뚱한 걸 잡을 수 있다.
+        log.append(f"⚠️ USB 카메라가 여러 대({len(cands)//2 or len(cands)}대로 추정) 보인다. "
+                   "udev 로 /dev/lerobot/overhead 를 만들어 두거나 --overhead-match 로 좁히는 걸 권함")
     if not cands:
         log.append("USB 카메라 후보 없음 — 케이블/허브 연결 확인 필요"
                    + (f" (match='{match}' 조건에 걸렸을 수도 있음)" if match else ""))

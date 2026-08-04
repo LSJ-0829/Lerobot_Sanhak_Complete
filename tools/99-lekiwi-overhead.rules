@@ -1,0 +1,32 @@
+# LeKiwi 상공(세탁기) 카메라 고정 이름 — /dev/lerobot/overhead
+#
+# 설치:
+#   sudo cp tools/99-lekiwi-overhead.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload
+#   sudo udevadm trigger --action=add
+# 확인:
+#   ls -l /dev/lerobot/overhead
+#
+# ─────────────────────────────────────────────────────────────────────────────────────────────
+# 왜 포트로 잡는가
+#
+# 이 리그의 카메라 4대는 전부 같은 USB ID 를 보고한다: 0c45:6366, SerialNumber=SN0001.
+# 그래서 vendor/product/serial 로는 서로 구분이 안 된다. 유일한 구분자는 '어느 USB 포트에
+# 꽂혔는가'(ID_PATH)뿐이다. csi-agent 의 99-lerobot.rules 도 Innomaker 2대(camera_1/camera_2)를
+# 같은 이유로 포트로 구분한다.
+#
+# ⚠️ 카메라를 다른 USB 포트에 꽂으면 이 규칙은 안 맞는다. 그때는 아래로 새 ID_PATH 를 확인해
+#    이 파일의 값을 바꾼다:
+#      udevadm info -q property -n /dev/videoN | grep ID_PATH=
+#    또는 python examples/lekiwi/find_overhead_cam.py --list 로 후보를 보고,
+#    laundry_task4.py 는 이 심볼릭 링크가 없어도 자동 탐색으로 동작한다(--overhead-cam auto).
+#
+# index==0 이 실제 영상 노드다(index==1 은 메타데이터 전용이라 프레임이 안 나온다).
+# ─────────────────────────────────────────────────────────────────────────────────────────────
+
+# 상공 카메라 (Sonix "USB 2.0 Camera", 포트 usb-0:6.3 — 2026-08-04 실측)
+SUBSYSTEM=="video4linux", ENV{ID_PATH}=="pci-0000:00:14.0-usb-0:6.3:1.0", ATTR{index}=="0", SYMLINK+="lerobot/overhead"
+
+# USB 자동절전 끄기 — 이 웹캠들은 포트가 서스펜드되면 재열거되면서 이미 열린 V4L2 핸들이
+# 영구히 무효화된다(녹화/추론 중 카메라가 멎어 보인다). csi-agent 규칙과 같은 처리.
+SUBSYSTEM=="usb", ATTR{idVendor}=="0c45", ATTR{idProduct}=="6366", TEST=="power/control", ATTR{power/control}="on"

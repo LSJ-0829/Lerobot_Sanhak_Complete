@@ -3,11 +3,16 @@
 
 두 본체를 순서대로 잇는다. 로봇 제어는 각 스크립트가 하고, 여기서는 '실행'만 이어붙인다.
 
-  [A] preflight : 원격 SO101 본체 SSH·경로·파이썬 확인 — 로봇이 움직이기 '전에' 먼저 확인해서,
-                  수건을 전달해 놓고 나서 SSH 가 안 되는 상황을 막는다.
-  [B] task3     : 로컬(랩탑)에서 laundry_task3.py 실행.
-                  approach → 문열기 → VLA 집기 → 복귀주행 → throw → (마지막 후퇴 후) 전달 모션.
-  [C] handoff   : task3 가 성공(exit 0)했을 때만 SSH 로 csi-agent 수건개기 rollout 실행.
+  [A]  preflight : 장비·경로 확인 — 로봇이 움직이기 '전에' 먼저 확인해서, 수건을 전달해 놓고
+                   다음 단계가 안 뜨는 상황을 막는다.
+  [B0] prewarm   : 수건개기 rollout 을 IDLE 로 미리 띄워 ACT 4단계 + classifier 를 올려 둔다.
+  [B]  task3     : laundry_task3.py 실행 (자기 preload → Enter → 실행).
+                   approach → 문열기 → VLA 집기 → 복귀주행 → throw → (마지막 후퇴 후) 전달 모션.
+  [C]  handoff   : task3 가 성공(exit 0)하면 미리 올려둔 rollout 이 그대로 이어받는다.
+
+■ Enter 는 딱 한 번이다.
+  무거운 로딩(SmolVLA + CLIP probe + ACT 4단계 + classifier)은 전부 그 Enter '앞'에서 끝난다.
+  Enter 이후로는 추가 입력도, 로딩 스톨도 없다. (--pause 를 주면 한 번 더 받는다.)
 
 ■ 원격(csi-agent, https://github.com/lhwdev/csi-agent) 실행 규약:
   bi_so_follower(SO101 2팔) + top/left/right 카메라. clothing/ 을 CWD 로 두고 실행해야 한다
@@ -27,16 +32,16 @@
 
 실행 (기본 원격 호스트: lerobot@115.145.179.95):
   # 연결/장비만 점검 — 로봇 안 움직임. 제일 먼저 이걸 돌려볼 것
-  python scripts/skills/laundry_pipeline.py --check
+  python scripts/skills/laundry_task4.py --check
 
   # 전체: LeKiwi 세탁물 회수 → SO101 수건개기
-  python scripts/skills/laundry_pipeline.py
+  python scripts/skills/laundry_task4.py
 
   # LeKiwi 는 이미 끝났고 SO101 만 트리거
-  python scripts/skills/laundry_pipeline.py --skip-task3
+  python scripts/skills/laundry_task4.py --skip-task3
 
   # 이 본체의 실제 경로를 지정하며 실행
-  python scripts/skills/laundry_pipeline.py --overhead-cam /dev/v4l/by-id/usb-XXXX-video-index0 \
+  python scripts/skills/laundry_task4.py --overhead-cam /dev/v4l/by-id/usb-XXXX-video-index0 \
       --jetson-ip 192.168.55.1 -- --record --skip-approach   # `--` 뒤는 전부 task3 인자
 
 환경변수 기본값: CSI_HOST, CSI_DIR, CSI_PYTHON, CSI_CMD, CSI_ENV,
@@ -48,6 +53,7 @@ import os
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -158,9 +164,119 @@ def ssh_cmd(args, script, tty=False):
     return [*base, args.csi_host, f"bash -lc {shlex.quote(script)}"]
 
 
+def csi_is_local(args):
+    """SO101 단계를 이 머신에서 바로 돌리는가(=여기가 SO101 본체인가)."""
+    return args.csi_host.strip().lower() in ("", "local", "localhost")
+
+
+class Prewarm:
+    """수건개기 rollout 을 '첫 Enter 전에' 미리 띄워 모델을 다 올려 두는 핸들.
+
+    왜 필요한가: 그냥 순서대로 돌리면 task3 가 끝난 '뒤'에 ACT 정책 4개 + classifier 를
+    로드하느라 수건을 든 채로 수십 초를 멈춰 있게 된다. 그래서 task3 의 preload 와 동시에
+    rollout 프로세스를 띄워 두고, 로딩이 끝난 상태로 IDLE 에서 대기시킨다.
+
+    IDLE 대기가 전제다 — 미리 띄우는 이상 --immediate_start 를 쓰면 수건이 오기도 전에
+    팔이 움직인다. 그래서 prewarm 은 항상 IDLE(classifier 판단) 모드로 돈다.
+
+    로딩 중 출력은 로그 파일로 보낸다. task3 의 Enter 프롬프트가 rollout 로그에 묻히면
+    안 되기 때문이다. task3 가 끝난 뒤 모아서 흘려준다.
+    """
+
+    def __init__(self, cmd, cwd, logpath, label):
+        self.logpath = logpath
+        self.label = label
+        self._fh = open(logpath, "wb")
+        self.p = subprocess.Popen(cmd, cwd=cwd, stdout=self._fh, stderr=subprocess.STDOUT)
+
+    def alive(self):
+        return self.p.poll() is None
+
+    def stop(self, why=""):
+        if self.alive():
+            print(f"  ⏹ 미리 띄운 수건개기 종료{(' — ' + why) if why else ''}")
+            self.p.terminate()
+            try:
+                self.p.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.p.kill()
+        self._fh.close()
+
+    def follow(self, prefix):
+        """지금까지의 로그를 뱉고, 프로세스가 끝날 때까지 이어서 흘린다."""
+        try:
+            with open(self.logpath, "r", errors="replace") as f:
+                while True:
+                    line = f.readline()
+                    if line:
+                        print(f"{prefix}{line.rstrip()}", flush=True)
+                        continue
+                    if self.p.poll() is not None:
+                        rest = f.read()
+                        for ln in rest.splitlines():
+                            print(f"{prefix}{ln}", flush=True)
+                        break
+                    time.sleep(0.2)
+        except KeyboardInterrupt:
+            self.stop("Ctrl+C")
+            raise
+        finally:
+            if not self._fh.closed:
+                self._fh.close()
+        return self.p.returncode
+
+
+def local_csi_cmd(args):
+    """SSH 없이 로컬에서 돌릴 커맨드 (CWD=<csi_dir>/clothing)."""
+    py = os.path.expanduser(args.csi_python)
+    return [py, *shlex.split(args.csi_cmd)], os.path.join(os.path.expanduser(args.csi_dir), "clothing")
+
+
+def start_prewarm(args):
+    """수건개기 rollout 을 IDLE 모드로 미리 띄운다(모델 로딩을 첫 Enter 앞으로 당기기)."""
+    idle_cmd = args.csi_cmd.replace("--immediate_start", "").strip()
+    log = os.path.join(tempfile.gettempdir(), f"laundry_task4_csi_{os.getpid()}.log")
+    print("─" * 60)
+    print("[B0] 수건개기 정책 미리 로딩 (IDLE 대기) — task3 preload 와 동시에 진행")
+    print(f"     `{idle_cmd}`   로그: {log}")
+    if csi_is_local(args):
+        cmd = [os.path.expanduser(args.csi_python), *shlex.split(idle_cmd)]
+        cwd = os.path.join(os.path.expanduser(args.csi_dir), "clothing")
+    else:
+        saved, args.csi_cmd = args.csi_cmd, idle_cmd
+        cmd, cwd = ssh_cmd(args, remote_script(args)), None
+        args.csi_cmd = saved
+    return Prewarm(cmd, cwd, log, "csi")
+
+
 def preflight(args):
     print("─" * 60)
-    print(f"[A] preflight: {args.csi_host} 연결/경로 확인")
+    where = "이 머신(로컬)" if csi_is_local(args) else args.csi_host
+    print(f"[A] preflight: SO101 쪽 확인 — {where}")
+
+    if csi_is_local(args):
+        # SSH 를 돌 이유가 없다. 같은 것들을 로컬에서 직접 확인한다.
+        ok = True
+        cdir = Path(os.path.expanduser(args.csi_dir)) / "clothing"
+        py = Path(os.path.expanduser(args.csi_python))
+        print(f"  | dir  : {cdir}{'' if cdir.is_dir() else '  ✗ 없음'}")
+        ok &= cdir.is_dir()
+        print(f"  | py   : {py}{'' if py.exists() else '  ✗ 없음'}")
+        ok &= py.exists()
+        if cdir.is_dir():
+            script = cdir / shlex.split(args.csi_cmd)[0]
+            print(f"  | cmd  : {args.csi_cmd}{'  OK' if script.exists() else '  ✗ 없음'}")
+            ok &= script.exists()
+        for d in ("follower_1", "follower_2", "camera_0", "camera_1", "camera_2"):
+            p = Path("/dev/lerobot") / d
+            print(f"  | dev  : {p}{'' if p.exists() else '  ✗ 없음(99-lerobot.rules 필요)'}")
+            ok &= p.exists()
+        if ok:
+            print("  ✅ preflight OK")
+        else:
+            print("  ✗ preflight 실패 — 위 ✗ 항목 확인")
+        return ok
+
     if not args.csi_host:
         print("  ✗ --csi-host 가 없습니다 (또는 CSI_HOST env). SO101 단계를 못 돌립니다.")
         return False
@@ -175,10 +291,16 @@ def preflight(args):
 
 def run_csi(args):
     print("─" * 60)
-    print(f"[C] SO101 수건개기: {args.csi_host}:{args.csi_dir}/clothing 에서 `{args.csi_cmd}`")
-    tty = sys.stdin.isatty() and not args.no_tty
-    rc = run_streaming(ssh_cmd(args, remote_script(args), tty=tty), "  ▸ ",
-                       show=f"ssh {args.csi_host} 'cd {args.csi_dir}/clothing && {args.csi_python} {args.csi_cmd}'")
+    if csi_is_local(args):
+        cmd, cwd = local_csi_cmd(args)
+        print(f"[C] SO101 수건개기(로컬): {cwd} 에서 `{args.csi_cmd}`")
+        rc = run_streaming(cmd, "  ▸ ", cwd=cwd)
+    else:
+        print(f"[C] SO101 수건개기: {args.csi_host}:{args.csi_dir}/clothing 에서 `{args.csi_cmd}`")
+        tty = sys.stdin.isatty() and not args.no_tty
+        rc = run_streaming(ssh_cmd(args, remote_script(args), tty=tty), "  ▸ ",
+                           show=f"ssh {args.csi_host} 'cd {args.csi_dir}/clothing && "
+                                f"{args.csi_python} {args.csi_cmd}'")
     if rc == 0:
         print("  ✅ 수건개기 완료")
     else:
@@ -251,7 +373,10 @@ def main():
     ap = argparse.ArgumentParser(
         description="LeKiwi 세탁물 회수(laundry_task3) → SO101 수건개기(csi-agent) 이어붙이기.",
         epilog="`--` 뒤의 인자는 전부 laundry_task3.py 로 그대로 넘어갑니다.")
-    ap.add_argument("--csi-host", default=CSI_HOST, help="SO101 본체 SSH 대상 (user@host). env CSI_HOST")
+    ap.add_argument("--csi-host", default=CSI_HOST,
+                    help="SO101 본체 SSH 대상 (user@host). 'local' 이면 SSH 없이 이 머신에서 실행. "
+                         "csi-agent 가 로컬에 있으면 자동으로 local 이 된다. env CSI_HOST")
+    ap.add_argument("--csi-local", action="store_true", help="SO101 단계를 이 머신에서 직접 실행(SSH 안 씀)")
     ap.add_argument("--csi-dir", default=CSI_DIR, help="원격 csi-agent 저장소 경로 (기본 ~/csi-agent)")
     ap.add_argument("--csi-python", default=CSI_PYTHON, help="원격 파이썬 (기본 conda lerobot env)")
     ap.add_argument("--csi-cmd", default=CSI_CMD,
@@ -279,7 +404,10 @@ def main():
     ap.add_argument("--skip-preflight", action="store_true", help="preflight 생략")
     ap.add_argument("--force-csi", action="store_true", help="원격 preflight 실패/ task3 실패에도 SO101 실행")
     ap.add_argument("--force-local", action="store_true", help="로컬 preflight 실패해도 task3 강행")
-    ap.add_argument("--pause", action="store_true", help="task3 종료 후 Enter 를 눌러야 SO101 시작")
+    ap.add_argument("--no-prewarm", dest="prewarm", action="store_false",
+                    help="수건개기 모델을 미리 올리지 않는다(=task3 끝난 뒤 로딩. 스톨 생김)")
+    ap.add_argument("--pause", action="store_true",
+                    help="task3 종료 후 Enter 를 한 번 더 받는다(기본은 Enter 한 번뿐)")
     ap.add_argument("--handoff-wait", type=float, default=float(os.environ.get("HANDOFF_WAIT", "0")),
                     help="전달 모션 후 SO101 시작까지 대기 초(기본 0)")
     ap.add_argument("--no-tty", action="store_true", help="원격에 TTY 할당 안 함(비대화 실행)")
@@ -288,8 +416,20 @@ def main():
     if passthrough and passthrough[0] == "--":
         passthrough = passthrough[1:]
 
-    # 원격 rollout 플래그 조정
-    if args.csi_idle:
+    # 이 머신이 곧 SO101 본체면(csi-agent 가 로컬에 있으면) SSH 를 돌 이유가 없다.
+    # 실제 시연은 SO101 본체 한 대에서 전 과정을 돌리므로 이게 기본 동작이 된다.
+    if args.csi_local:
+        args.csi_host = "local"
+    elif "--csi-host" not in sys.argv and not csi_is_local(args):
+        if (Path(os.path.expanduser(args.csi_dir)) / "clothing").is_dir():
+            print("  ℹ️ 이 머신에 csi-agent 가 있어 로컬 모드로 전환합니다 (SSH 안 씀). "
+                  "원격으로 강제하려면 --csi-host 를 명시하세요.")
+            args.csi_host = "local"
+
+    # 원격 rollout 플래그 조정.
+    # prewarm 이 켜져 있으면(기본) IDLE 이 강제된다 — 미리 띄우는 이상 --immediate_start 를 쓰면
+    # 수건이 도착하기도 전에 팔이 움직인다. 대신 로딩이 전부 첫 Enter 앞에서 끝난다.
+    if args.csi_idle or (args.prewarm and not args.skip_csi and not args.skip_task3):
         args.csi_cmd = args.csi_cmd.replace("--immediate_start", "").strip()
     if args.csi_no_step0 and "--no_step0" not in args.csi_cmd:
         args.csi_cmd += " --no_step0"
@@ -303,7 +443,8 @@ def main():
     print(f"  task3    : {args.task3}{' [skip]' if args.skip_task3 else ''}")
     print(f"  task3 인자: {' '.join(passthrough) if passthrough else '(없음)'}")
     print(f"  상공캠   : {args.overhead_cam}   Jetson: {args.jetson_ip or '(task3 기본값)'}")
-    print(f"  SO101    : {args.csi_host or '(미설정)'}:{args.csi_dir}/clothing "
+    _where = "로컬" if csi_is_local(args) else args.csi_host
+    print(f"  SO101    : {_where}:{args.csi_dir}/clothing "
           f"→ {args.csi_cmd}{' [skip]' if args.skip_csi else ''}")
 
     # [A] preflight — 로봇이 움직이기 전에 원격/로컬 장비부터 확인
@@ -327,15 +468,26 @@ def main():
             print("  --overhead-cam / --jetson-ip 로 이 본체의 실제 경로를 지정하거나, --force-local 로 강행하세요.")
             return 1
 
+    # [B0] prewarm — 무거운 로딩(SmolVLA·probe / ACT 4단계·classifier)을 전부 첫 Enter '앞'으로.
+    #      task3 는 자기 preload 를 끝낸 뒤에야 Enter 를 묻고, 수건개기는 그 사이 IDLE 로 올라온다.
+    #      Enter 이후에는 추가 입력도, 로딩 스톨도 없다.
+    warm = None
+    if args.prewarm and not args.skip_csi and not args.skip_task3:
+        warm = start_prewarm(args)
+
     # [B] LeKiwi
     rc3 = 0
     if not args.skip_task3:
         try:
             rc3 = run_task3(args, passthrough)
         except KeyboardInterrupt:
+            if warm:
+                warm.stop("파이프라인 중단")
             print("\n[중단] 파이프라인 Ctrl+C")
             return 130
         if rc3 != 0 and not args.force_csi:
+            if warm:
+                warm.stop("task3 실패 — 수건이 오지 않음")
             print("\n✗ task3 가 성공하지 못해 SO101 단계를 시작하지 않습니다 (--force-csi 로 강행 가능).")
             return rc3
 
@@ -348,8 +500,18 @@ def main():
         time.sleep(args.handoff_wait)
     if args.pause:
         input("SO101 수건개기를 시작하려면 Enter: ")
+
     try:
-        rc_csi = run_csi(args)
+        if warm is not None:
+            print("─" * 60)
+            if warm.alive():
+                print("[C] SO101 수건개기 — 이미 로딩 완료된 프로세스가 이어받습니다(로딩 스톨 없음)")
+            else:
+                print("[C] ⚠️ 미리 띄운 수건개기 프로세스가 이미 종료됨 — 로그를 확인하세요")
+            rc_csi = warm.follow("  ▸ ")
+            print("  ✅ 수건개기 완료" if rc_csi == 0 else f"  ✗ 수건개기 실패/중단 (exit {rc_csi})")
+        else:
+            rc_csi = run_csi(args)
     except KeyboardInterrupt:
         print("\n[중단] 파이프라인 Ctrl+C")
         return 130
