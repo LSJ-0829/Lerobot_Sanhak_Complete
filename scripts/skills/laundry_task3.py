@@ -91,11 +91,16 @@ STEP = float(os.environ.get("STEP", "0.15"))          # approach 펄스 최대 �
 APPROACH_TIMEOUT = float(os.environ.get("APPROACH_TIMEOUT", "40"))
 # approach 전용 저속. V_FWD/V_STRAFE 를 낮추면 [7] 복귀 주행처럼 '시간 기반' 이동거리가 같이
 # 줄어들기 때문에 여기서만 따로 쓴다(V_FWD=0.15 로 한 펄스가 약 2cm 라 목표 근처에서 튄다).
-V_APPROACH = float(os.environ.get("V_APPROACH", "0.08"))
-V_APPROACH_Y = float(os.environ.get("V_APPROACH_Y", "0.07"))
-# 오차 비례 펄스: 오차가 FULL_PX 이상이면 STEP 전체, 가까워질수록 짧아져 STEP_MIN 까지 준다.
-STEP_MIN = float(os.environ.get("STEP_MIN", "0.04"))
+V_APPROACH = float(os.environ.get("V_APPROACH", "0.05"))     # strafe 최대
+V_APPROACH_Y = float(os.environ.get("V_APPROACH_Y", "0.05"))  # 전후진 최대
+V_APPROACH_MIN = float(os.environ.get("V_APPROACH_MIN", "0.03"))  # 이보다 느리면 모터가 안 돈다
+# 이 오차(px)에서 최대 속도. 그보다 작으면 비례해서 느려진다.
 APPROACH_FULL_PX = float(os.environ.get("APPROACH_FULL_PX", "80"))
+# 실측(2026-08-04, 시연 본체): y.vel=+0.08 을 0.5초 주면 화면상 cx 가 +41px 커진다.
+# 즉 cx 를 '줄이려면' y.vel 은 음수여야 한다. 배치가 바뀌어 반대가 되면 -1 로 뒤집는다.
+Y_VEL_TO_CX = float(os.environ.get("Y_VEL_TO_CX", "+1"))
+# 실측: x.vel=+0.10 전진 시 cy 가 -11px 작아진다 → cy 를 줄이려면 x.vel 은 양수.
+X_VEL_TO_CY = float(os.environ.get("X_VEL_TO_CY", "-1"))
 # 전후진 허용오차(px). 4 는 너무 빡빡해서 한 STEP 이 그보다 크게 움직이면 영원히 진동한다.
 APPROACH_Y_TOL = float(os.environ.get("APPROACH_Y_TOL", "8"))
 # 문열기 base 이동 시간(초) — 직접버스 기본과 같은 값, 속도가 달라 재보정 필요
@@ -176,10 +181,17 @@ def rotate(robot, clockwise, seconds, **kw):  # True=시계(우)
     move_base(robot, theta=w, seconds=seconds, **kw)
 
 
-def _pulse(err_px):
-    """오차(px)에 비례한 펄스 길이(초). 목표에 가까울수록 짧게 → 오버슈트 방지."""
+def _p_vel(err_px, v_max, axis_sign):
+    """오차(px)에 비례한 속도(m/s). 펄스+정지를 반복하지 않으므로 움직임이 부드럽다.
+
+    axis_sign: 그 축의 '오차를 줄이는' 부호(실측으로 확정. Y_VEL_TO_CX / X_VEL_TO_CY).
+    너무 느리면 모터가 안 도므로 V_APPROACH_MIN 밑으로는 안 내려간다.
+    """
+    if err_px == 0:
+        return 0.0
     frac = min(1.0, abs(err_px) / max(1.0, APPROACH_FULL_PX))
-    return max(STEP_MIN, STEP * frac)
+    v = max(V_APPROACH_MIN, v_max * frac)
+    return -axis_sign * (1 if err_px > 0 else -1) * v
 
 
 def replay_motion(robot, name, rec=None, ohcap=None):
@@ -248,8 +260,8 @@ def approach(robot, cal, y_tol=None, rec=None, ohcap=None, gui_win=None):
     cx0_cfg = cal["center_x"]
     print(f"[approach] 빨간 손잡이 접근 — 목표 cx={cx0_cfg} cy={cal['target_y']} "
           f"(허용 x±{cal['dead_x']} y±{y_tol}), 최대 {APPROACH_TIMEOUT}s")
-    print(f"[approach] 저속 {V_APPROACH}/{V_APPROACH_Y} m/s, 펄스 {STEP_MIN}~{STEP}s "
-          f"(오차 {APPROACH_FULL_PX}px 이상이면 최대) → 한 펄스 약 0.2~0.9cm")
+    print(f"[approach] 연속 비례 제어 — 최대 strafe {V_APPROACH} / 전후 {V_APPROACH_Y} m/s, "
+          f"최소 {V_APPROACH_MIN} m/s, 오차 {APPROACH_FULL_PX}px 에서 최대속도")
     deadline = time.time() + APPROACH_TIMEOUT
     last_log = 0.0
     first = None       # 처음 관측한 (cx, cy) — 방향이 맞는지 판단용
@@ -285,28 +297,25 @@ def approach(robot, cal, y_tol=None, rec=None, ohcap=None, gui_win=None):
             first = (cx, cy)
         dx, dy = cx - cx0, cy - cal["target_y"]
 
-        # 1) 좌우 정렬(strafe) — 오차에 비례한 짧은 펄스
-        if abs(dx) > cal["dead_x"]:
-            p = _pulse(dx)
-            act = f"strafe {'오른쪽' if dx > 0 else '왼쪽'} {p:.2f}s"
-            if time.time() - last_log > 1.5:
-                print(f"[approach] cx={cx}(목표 {cx0}, 차이 {dx:+d}) cy={cy} area={int(area)} → {act}")
-                last_log = time.time()
-            move_base(robot, y=(-1 if cx < cx0 else +1) * Y_RIGHT * V_APPROACH,
-                      seconds=p, arm=arm)
-            continue
-        # 2) 전후진
-        if abs(dy) <= y_tol:
+        # 두 축을 '동시에', '연속으로' 제어한다. 예전처럼 펄스를 주고 멈추기를 반복하면
+        # 휙휙 끊겨 보인다. 매 주기 오차에 비례한 속도를 갱신해 보내면 부드럽게 수렴한다.
+        aligned_x = abs(dx) <= cal["dead_x"]
+        aligned_y = abs(dy) <= y_tol
+        if aligned_x and aligned_y:
             _stop(robot, arm)
             print(f"[approach] ✅ 도착 cx={cx}(목표 {cx0}) cy={cy}(목표 {cal['target_y']}) area={int(area)}")
             return True
-        p = _pulse(dy)
-        act = f"{'전진' if dy > 0 else '후진'} {p:.2f}s"
-        if time.time() - last_log > 1.5:
-            print(f"[approach] cx={cx}✓ cy={cy}(목표 {cal['target_y']}, 차이 {dy:+d}) area={int(area)} → {act}")
+
+        vy = 0.0 if aligned_x else _p_vel(dx, V_APPROACH, Y_VEL_TO_CX)
+        vx = 0.0 if aligned_y else _p_vel(dy, V_APPROACH_Y, X_VEL_TO_CY)
+        _send_base(robot, x=vx, y=vy, arm=arm)
+
+        if time.time() - last_log > 1.0:
+            print(f"[approach] cx={cx}{'✓' if aligned_x else f'(차이 {dx:+d})'} "
+                  f"cy={cy}{'✓' if aligned_y else f'(차이 {dy:+d})'} area={int(area)} "
+                  f"→ x={vx:+.3f} y={vy:+.3f} m/s")
             last_log = time.time()
-        move_base(robot, x=(+1 if cy > cal["target_y"] else -1) * V_APPROACH_Y,
-                  seconds=p, arm=arm)
+        time.sleep(1.0 / FPS)
 
     _stop(robot)
     print(f"[approach] ⚠️ 타임아웃({APPROACH_TIMEOUT}s)")
