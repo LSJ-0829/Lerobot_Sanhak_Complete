@@ -1,0 +1,35 @@
+{
+  "_comment": "approach_then_center_black.py 1단계(세탁기 빨간 손잡이 접근) 파라미터. 재학습/조정 시 이 파일만 수정하면 됨(스크립트 수정 불필요).",
+  "_measured": "2026-06-30 재학습(calibrate_red.py, 60프레임): area median=3536[3415~3717], cx=282, cy=22",
+  "TARGET_Y": 22,
+  "AREA_THRESHOLD": 3182,
+  "CENTER_X": 282,
+  "DEAD_ZONE_X": 50,
+  "DETECT_AREA_MIN": 300,
+  "WHEEL_SPEED": 600,
+  "ROTATE_SPEED": 300,
+  "SCAN_STEP": 0.3,
+  "MAX_SCAN_TIME": 35.0,
+  "HSV": {
+    "lower_red1": [
+      0,
+      225,
+      26
+    ],
+    "upper_red1": [
+      5,
+      255,
+      255
+    ],
+    "lower_red2": [
+      162,
+      121,
+      34
+    ],
+    "upper_red2": [
+      180,
+      255,
+      255
+    ]
+  }
+}
