@@ -1,0 +1,12 @@
+[Unit]
+Description=LeKiwi Jetson USB ethernet link (static 192.168.55.100)
+After=network.target NetworkManager.service
+Wants=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/lekiwi-usbnet.sh
+
+[Install]
+WantedBy=multi-user.target

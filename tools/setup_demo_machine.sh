@@ -76,3 +76,8 @@ echo "[5] 검증"
 "$PY" "$HERE/examples/lekiwi/find_overhead_cam.py" 2>&1 | tail -4
 echo
 "$PY" "$HERE/scripts/skills/laundry_task4.py" --check 2>&1 | tail -22
+
+# ── 6) Jetson USB 이더넷 (선택) ───────────────────────────────────────────────
+# sudo install -m 755 tools/lekiwi-usbnet.sh /usr/local/sbin/lekiwi-usbnet.sh
+# sudo install -m 644 tools/lekiwi-usbnet.service /etc/systemd/system/
+# sudo systemctl daemon-reload && sudo systemctl enable --now lekiwi-usbnet.service

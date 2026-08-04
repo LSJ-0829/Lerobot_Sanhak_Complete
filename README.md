@@ -83,18 +83,39 @@ python scripts/skills/laundry_task4.py -- --record --skip-approach
 전제: Jetson `lekiwi_host` 가 떠 있을 것(파이프라인이 SSH 로 자동 기동 시도),
 상공 USB 카메라가 연결돼 `/dev/lerobot/overhead` 가 잡혀 있을 것.
 
-## Jetson 연결 (LeKiwi)
+## Jetson 연결 (LeKiwi) — 정적 IP 로만 붙인다
 
-Jetson 은 USB-C 이더넷 가젯으로 붙는다. 시연 본체에서 `enx…` 인터페이스가 **LOWER_UP 인데
-IP 가 없으면** LeKiwi 에 못 닿는다(`192.168.55.1` ping 실패). NetworkManager 에서 그 인터페이스가
-`disconnected` 로 남아 있는 상태다.
+Jetson 은 USB-C 이더넷 가젯으로 붙는다. Jetson=`192.168.55.1`, 이 머신=`192.168.55.100`.
 
 ```bash
-ip -brief addr                  # enx… 가 UP 인데 주소가 없는지 확인
-nmcli device status             # enx… 가 disconnected 인지 확인
+sudo install -m 755 tools/lekiwi-usbnet.sh /usr/local/sbin/lekiwi-usbnet.sh
+sudo install -m 644 tools/lekiwi-usbnet.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now lekiwi-usbnet.service
+ping -c1 192.168.55.1
 ```
 
-⚠️ 메인 이더넷(`enp2s0`, 이 본체의 인터넷·SSH 회선)은 절대 건드리지 말 것.
+### ⚠️ DHCP(`nmcli device connect`)를 쓰면 안 된다
+
+Jetson 이 DHCP 로 **default route 까지 내려주고**, NetworkManager 가 그걸 설치하면서
+이 머신의 기본 게이트웨이를 뺏어간다 — 인터넷과 원격 접속이 통째로 끊긴다.
+2026-08-04 에 실제로 겪었고, 본체 앞에서 직접 복구해야 했다.
+
+정적 IP 만 부여하면 link-scope 라우트(`192.168.55.0/24`)만 생기고 default route 는
+구조적으로 만들어질 수 없다. `lekiwi-usbnet.sh` 가 그 방식이고, 해당 인터페이스를
+NetworkManager `unmanaged` 로 돌려 DHCP 가 끼어들 여지도 없앤다.
+
+Jetson 은 USB 가젯을 두 개(`enx…` 2개) 노출하는데 **어느 쪽이 살아있는지는 그때그때 다르다**
+(실측: 한 번은 `…afe`, 재연결 후엔 `…afc`). 스크립트가 둘 다 시도해 응답하는 쪽에 붙인다.
+
+⚠️ 메인 이더넷(`enp2s0`, 이 본체의 인터넷·SSH 회선)은 어떤 경우에도 건드리지 말 것.
+
+### lekiwi_host 확인은 반드시 포트로
+
+```bash
+ssh comnet02@192.168.55.1 'ss -ltn | grep -E ":5555|:5556"'
+```
+
+`pgrep -f lekiwi_host` 는 **SSH 명령줄 자체를 매칭**해서 죽었는데도 "실행중" 으로 나온다.
 
 ## 두 단계를 어떻게 잇는가
 
