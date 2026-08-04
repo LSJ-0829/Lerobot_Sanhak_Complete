@@ -81,10 +81,19 @@ GRIP_SQUEEZE_SEC = float(os.environ.get("GRIP_SQUEEZE_SEC", "1.2"))
 # ══════════════════ ⚠️ CALIBRATION (실기 재보정) ══════════════════
 # ZMQ base 속도는 m/s(x,y)·rad/s(theta) 물리단위라 기존 직접버스 wheel-speed/시간과 다르다.
 # 부호(Y_RIGHT/THETA_CW)는 실기에서 방향 확인 후 뒤집는다.
-V_FWD = float(os.environ.get("V_FWD", "0.15"))       # 전후진 속도 m/s
-V_STRAFE = float(os.environ.get("V_STRAFE", "0.12"))  # 좌우 strafe 속도 m/s
-V_ROT = float(os.environ.get("V_ROT", "0.6"))         # 회전 속도 rad/s
-Y_RIGHT = float(os.environ.get("Y_RIGHT", "1"))       # y.vel 부호: +값이 '오른쪽'이면 1
+# 아래 세 값은 검증된 직접버스 구현(~/Lerobot_Sanhak, laundry/open_door2.py, grab_place.py)의
+# wheel-speed(drive 500 / strafe 400 / rotate 300)에서 역산했다. 시간 기반 이동은 그 속도 기준으로
+# 보정돼 있어서, 속도가 다르면 거리가 통째로 어긋난다.
+#   raw = wheel_linear(m/s) × 13038
+#   전진  raw500 → 500/(0.866×13038) = 0.044 m/s   (open_door2/grab_place drive_speed=500)
+#   strafe raw400 → 400/(1.000×13038) = 0.031 m/s   (open_door2 strafe_speed=400)
+#   회전  raw300 → 300/(0.125×13038) = 0.184 rad/s
+# 검산: 0.184 rad/s × 16.9s = 178도 — Lerobot_Sanhak/laundry_task3 의 "16.9초(speed 300 실측)"와 일치.
+V_FWD = float(os.environ.get("V_FWD", "0.044"))       # 전후진 속도 m/s
+V_STRAFE = float(os.environ.get("V_STRAFE", "0.031"))  # 좌우 strafe 속도 m/s
+V_ROT = float(os.environ.get("V_ROT", "0.184"))        # 회전 속도 rad/s
+# 실기 확인(2026-08-04): 좌우가 반대로 나가서 뒤집었다.
+Y_RIGHT = float(os.environ.get("Y_RIGHT", "-1"))      # y.vel 부호: +값이 '오른쪽'이면 1
 THETA_CW = float(os.environ.get("THETA_CW", "-1"))    # theta.vel 부호: 시계(우)회전이 음수면 -1
 STEP = float(os.environ.get("STEP", "0.15"))          # approach 펄스 최대 길이(초)
 # approach
@@ -98,7 +107,7 @@ V_APPROACH_MIN = float(os.environ.get("V_APPROACH_MIN", "0.03"))  # 이보다 �
 APPROACH_FULL_PX = float(os.environ.get("APPROACH_FULL_PX", "80"))
 # 실측(2026-08-04, 시연 본체): y.vel=+0.08 을 0.5초 주면 화면상 cx 가 +41px 커진다.
 # 즉 cx 를 '줄이려면' y.vel 은 음수여야 한다. 배치가 바뀌어 반대가 되면 -1 로 뒤집는다.
-Y_VEL_TO_CX = float(os.environ.get("Y_VEL_TO_CX", "+1"))
+Y_VEL_TO_CX = float(os.environ.get("Y_VEL_TO_CX", "-1"))
 # 실측: x.vel=+0.10 전진 시 cy 가 -11px 작아진다 → cy 를 줄이려면 x.vel 은 양수.
 X_VEL_TO_CY = float(os.environ.get("X_VEL_TO_CY", "-1"))
 # 전후진 허용오차(px). 4 는 너무 빡빡해서 한 STEP 이 그보다 크게 움직이면 영원히 진동한다.
@@ -110,9 +119,9 @@ BACKDRIVE_SEC = float(os.environ.get("BACKDRIVE_SEC", "2.0"))        # 후진+1�
 POST_OPEN_STRAFE_SEC = float(os.environ.get("POST_OPEN_STRAFE_SEC", "2.0"))  # 모션후 왼쪽
 POST_OPEN_FORWARD_SEC = float(os.environ.get("POST_OPEN_FORWARD_SEC", "1.0"))
 # 복귀 주행(집은 뒤): 후진→180도 회전→직진→(throw 후)후진
-BACKUP_SEC = float(os.environ.get("BACKUP_SEC", "3.0"))
-ROTATE_SEC = float(os.environ.get("ROTATE_SEC", "5.0"))   # 180도 되게 실측
-FORWARD_SEC = float(os.environ.get("FORWARD_SEC", "3.0"))
+BACKUP_SEC = float(os.environ.get("BACKUP_SEC", "5.0"))
+ROTATE_SEC = float(os.environ.get("ROTATE_SEC", "16.9"))   # 180도 되게 실측
+FORWARD_SEC = float(os.environ.get("FORWARD_SEC", "5.0"))
 RETREAT_SEC = float(os.environ.get("RETREAT_SEC", "2.0"))
 RECORD_STRIDE = int(os.environ.get("RECORD_STRIDE", "3"))
 # ═════════════════════════════════════════════════════════════════
