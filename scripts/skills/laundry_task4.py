@@ -311,7 +311,8 @@ def start_prewarm(args):
     if csi_is_local(args):
         inner = " ".join(shlex.quote(c) for c in
                          [os.path.expanduser(args.csi_python), *shlex.split(idle_cmd)])
-        cmd = ["bash", "-c", f"yes '' | {inner}"]
+        # 로그 파일로 나가므로 더더욱 버퍼링을 꺼야 follow() 가 실시간으로 보여줄 수 있다.
+        cmd = ["bash", "-c", f"yes '' | PYTHONUNBUFFERED=1 {inner}"]
         cwd = os.path.join(os.path.expanduser(args.csi_dir), "clothing")
     else:
         saved, args.csi_cmd = args.csi_cmd, idle_cmd
@@ -426,6 +427,10 @@ def run_task3(args, passthrough):
     print("─" * 60)
     print(f"[B] LeKiwi 세탁물 회수: {args.task3}")
     env = dict(os.environ)
+    # stdout 이 파이프면 파이썬이 블록 버퍼링을 한다 → flush=True 가 없는 print 는 수 KB 쌓일
+    # 때까지 화면에 안 나온다. approach 진행 로그처럼 '실시간으로 봐야 하는' 출력이 뭉쳐서
+    # 나오면 쓸모가 없으므로 버퍼링을 끈다.
+    env["PYTHONUNBUFFERED"] = "1"
     env["OVERHEAD_CAM"] = args.overhead_cam          # 본체마다 다른 카메라 경로를 여기서 주입
     if args.jetson_ip:
         env["REMOTE_IP"] = args.jetson_ip            # 지정 시 task3 의 유/무선 기본값보다 우선
