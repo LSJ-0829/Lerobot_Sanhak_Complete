@@ -50,7 +50,9 @@
 
 import argparse
 import os
+import select
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -99,14 +101,45 @@ def local_python() -> str:
 def run_streaming(cmd, prefix, cwd=None, env=None, show=None):
     """자식 프로세스 출력을 prefix 붙여 실시간으로 흘리고 returncode 를 돌려준다.
 
+    줄 단위로만 읽으면 안 된다: input() 의 프롬프트는 줄바꿈이 없어서 버퍼에 갇히고,
+    사용자는 "Enter 를 기다리는 중"인지 "아직 로딩 중"인지 알 수 없게 된다.
+    그래서 출력이 잠시 멎으면(=상대가 입력을 기다리는 상태) 남은 조각을 그대로 내보낸다.
+
     show 를 주면 그 문자열을 대신 표시한다(ssh 원격 스크립트는 따옴표 때문에 원문이 읽기 어렵다).
     """
     print(f"  $ {show or ' '.join(shlex.quote(c) for c in cmd)}", flush=True)
     p = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE,
-                         stderr=subprocess.STDOUT, text=True, bufsize=1)
+                         stderr=subprocess.STDOUT, bufsize=0)
+    fd = p.stdout.fileno()
+    buf = b""
+
+    def emit_lines():
+        nonlocal buf
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            print(f"{prefix}{line.decode('utf-8', 'replace').rstrip()}", flush=True)
+
     try:
-        for line in p.stdout:
-            print(f"{prefix}{line.rstrip()}", flush=True)
+        while True:
+            ready, _, _ = select.select([fd], [], [], 0.3)
+            if ready:
+                chunk = os.read(fd, 8192)
+                if not chunk:            # EOF
+                    buf += b""
+                    break
+                buf += chunk
+                emit_lines()
+            else:
+                # 0.3초간 조용하다 = 줄바꿈 없이 멈춘 것(프롬프트). 있는 그대로 흘려준다.
+                if buf:
+                    sys.stdout.write(f"{prefix}{buf.decode('utf-8', 'replace')}")
+                    sys.stdout.flush()
+                    buf = b""
+                if p.poll() is not None:
+                    break
+        emit_lines()
+        if buf:
+            print(f"{prefix}{buf.decode('utf-8', 'replace').rstrip()}", flush=True)
     except KeyboardInterrupt:
         print(f"\n{prefix}[중단] Ctrl+C → 자식 프로세스 종료 중...", flush=True)
         p.terminate()
@@ -116,13 +149,15 @@ def run_streaming(cmd, prefix, cwd=None, env=None, show=None):
             p.kill()
         raise
     finally:
-        if p.stdout:
+        try:
             p.stdout.close()
+        except Exception:
+            pass
     return p.wait()
 
 
 # ─────────────────────── [C] 원격(csi-agent) 실행 ───────────────────────
-def remote_script(args, preflight_only=False):
+def remote_script(args, preflight_only=False, feed_enter=False):
     """원격에서 돌릴 bash 스크립트. clothing/ 을 CWD 로 잡는 게 핵심."""
     d = args.csi_dir.rstrip("/")
     py = args.csi_python
@@ -152,7 +187,9 @@ def remote_script(args, preflight_only=False):
     else:
         if args.csi_env:
             lines.append("export " + args.csi_env)
-        lines.append(f'exec "$CSI_PY" {args.csi_cmd}')
+        # feed_enter: 캘리브레이션 프롬프트에 빈 줄을 계속 먹여 준다(무인 실행용).
+        lines.append(f'yes "" | exec "$CSI_PY" {args.csi_cmd}' if feed_enter
+                     else f'exec "$CSI_PY" {args.csi_cmd}')
     return "\n".join(lines)
 
 
@@ -188,33 +225,59 @@ class Prewarm:
         self.logpath = logpath
         self.label = label
         self._fh = open(logpath, "wb")
-        self.p = subprocess.Popen(cmd, cwd=cwd, stdout=self._fh, stderr=subprocess.STDOUT)
+        # stdin 을 터미널에서 떼어낸다. 안 그러면 rollout 의 캘리브레이션 프롬프트
+        # ("Press ENTER to use provided calibration file...")가 task3 의 시작 Enter 를
+        # 가로챈다 — 같은 tty 를 두 프로세스가 읽으면 누가 먹을지 정해지지 않는다.
+        # start_new_session: 자체 프로세스 그룹을 준다. `yes '' | python ...` 은 bash 를 거치므로
+        # terminate() 로 bash 만 죽이면 python 이 로봇을 쥔 채 살아남는다 → 다음 실행이 장치를
+        # 못 연다. 그룹 전체에 시그널을 보내야 확실히 정리된다.
+        self.p = subprocess.Popen(cmd, cwd=cwd, stdout=self._fh, stderr=subprocess.STDOUT,
+                                  stdin=subprocess.DEVNULL, start_new_session=True)
 
     def alive(self):
         return self.p.poll() is None
 
+    def _signal_group(self, sig):
+        try:
+            os.killpg(os.getpgid(self.p.pid), sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+
     def stop(self, why=""):
         if self.alive():
             print(f"  ⏹ 미리 띄운 수건개기 종료{(' — ' + why) if why else ''}")
-            self.p.terminate()
+            self._signal_group(signal.SIGTERM)
             try:
                 self.p.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                self.p.kill()
-        self._fh.close()
+                self._signal_group(signal.SIGKILL)
+                try:
+                    self.p.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+        if not self._fh.closed:
+            self._fh.close()
 
     def follow(self, prefix):
-        """지금까지의 로그를 뱉고, 프로세스가 끝날 때까지 이어서 흘린다."""
+        """지금까지의 로그를 뱉고, 프로세스가 끝날 때까지 이어서 흘린다.
+
+        로그가 쓰이는 도중에는 readline() 이 줄바꿈 없는 반쪽 줄을 돌려준다. 그대로 찍으면
+        한 줄이 여러 줄로 쪼개져 보이므로, 줄바꿈이 올 때까지 모았다가 내보낸다.
+        """
+        pending = ""
         try:
             with open(self.logpath, "r", errors="replace") as f:
                 while True:
-                    line = f.readline()
-                    if line:
-                        print(f"{prefix}{line.rstrip()}", flush=True)
+                    chunk = f.readline()
+                    if chunk:
+                        pending += chunk
+                        if pending.endswith("\n"):
+                            print(f"{prefix}{pending.rstrip()}", flush=True)
+                            pending = ""
                         continue
                     if self.p.poll() is not None:
-                        rest = f.read()
-                        for ln in rest.splitlines():
+                        pending += f.read()
+                        for ln in pending.splitlines():
                             print(f"{prefix}{ln}", flush=True)
                         break
                     time.sleep(0.2)
@@ -240,12 +303,19 @@ def start_prewarm(args):
     print("─" * 60)
     print("[B0] 수건개기 정책 미리 로딩 (IDLE 대기) — task3 preload 와 동시에 진행")
     print(f"     `{idle_cmd}`   로그: {log}")
+    print("     ⚠️ 이 프로세스는 지금부터 top 카메라를 보고 있습니다. 접는 판에 이미 수건이 있으면")
+    print("        task3 가 끝나기 전에도 SO101 이 움직입니다. 판을 비워 두고 시작하세요.")
+    # `yes '' |` 로 빈 줄을 계속 먹여 준다 — lerobot 의 로봇 connect 는
+    # "Press ENTER to use provided calibration file..." 로 Enter 를 요구하는데,
+    # 빈 줄이면 기존 캘리브레이션을 그대로 쓴다. (ensure_host 도 같은 방식을 쓴다.)
     if csi_is_local(args):
-        cmd = [os.path.expanduser(args.csi_python), *shlex.split(idle_cmd)]
+        inner = " ".join(shlex.quote(c) for c in
+                         [os.path.expanduser(args.csi_python), *shlex.split(idle_cmd)])
+        cmd = ["bash", "-c", f"yes '' | {inner}"]
         cwd = os.path.join(os.path.expanduser(args.csi_dir), "clothing")
     else:
         saved, args.csi_cmd = args.csi_cmd, idle_cmd
-        cmd, cwd = ssh_cmd(args, remote_script(args)), None
+        cmd, cwd = ssh_cmd(args, remote_script(args, feed_enter=True)), None
         args.csi_cmd = saved
     return Prewarm(cmd, cwd, log, "csi")
 
@@ -502,11 +572,20 @@ def main():
     if args.skip_csi:
         print("\n✅ task3 까지 완료 (SO101 단계는 --skip-csi 로 생략).")
         return rc3
-    if args.handoff_wait > 0:
-        print(f"  ⏳ 전달 후 {args.handoff_wait}s 대기...")
-        time.sleep(args.handoff_wait)
-    if args.pause:
-        input("SO101 수건개기를 시작하려면 Enter: ")
+    try:
+        if args.handoff_wait > 0:
+            print(f"  ⏳ 전달 후 {args.handoff_wait}s 대기...")
+            time.sleep(args.handoff_wait)
+        if args.pause:
+            if warm is not None:
+                print("  (참고: 미리 띄운 수건개기는 classifier 가 수건을 인식하면 이 Enter 와")
+                print("   무관하게 이미 시작했을 수 있습니다. 이 Enter 는 로그 출력을 여는 것입니다.)")
+            input("  >>> 계속하려면 Enter: ")
+    except KeyboardInterrupt:
+        if warm:
+            warm.stop("파이프라인 중단")
+        print("\n[중단] 파이프라인 Ctrl+C")
+        return 130
 
     try:
         if warm is not None:

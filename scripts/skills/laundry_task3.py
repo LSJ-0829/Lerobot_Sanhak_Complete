@@ -435,7 +435,14 @@ def main():
                    fps=max(1, FPS // RECORD_STRIDE)) if args.record else None
 
     if not args.yes:
-        input("시작하려면 Enter (로봇이 스스로 움직입니다. 손 뗄 준비): ")
+        # 배너는 반드시 줄바꿈으로 끝내고 flush 한다 — input() 의 프롬프트는 줄바꿈이 없어서
+        # 파이프로 읽는 쪽(laundry_task4)에서 버퍼에 갇혀 화면에 안 보인다.
+        print("\n" + "=" * 60, flush=True)
+        print("  ⏸  준비 완료. 여기서 대기 중입니다 — 로딩이 아닙니다.", flush=True)
+        print("  ▶  손 떼고 Enter 를 누르면 로봇이 스스로 움직입니다.", flush=True)
+        print("=" * 60, flush=True)
+        input("  >>> Enter 를 누르세요: ")
+        print("  ▶ 시작합니다.", flush=True)
 
     def read_oh():
         ok, f = ohcap.read(); return f if ok else None
