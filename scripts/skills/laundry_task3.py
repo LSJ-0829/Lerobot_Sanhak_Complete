@@ -107,27 +107,53 @@ RECORD_STRIDE = int(os.environ.get("RECORD_STRIDE", "3"))
 
 
 # ─────────────────────── base(ZMQ) 이동 헬퍼 ───────────────────────
-def _send_base(robot, x=0.0, y=0.0, theta=0.0):
-    robot.send_action({"x.vel": float(x), "y.vel": float(y), "theta.vel": float(theta)})
+# ⚠️ 액션에는 팔 자세(.pos)를 '반드시' 같이 실어야 한다.
+#    Jetson host 의 send_action 은 이렇게 나뉜다:
+#        arm_goal_pos  = {k: v for k, v in action.items() if k.endswith(".pos")}
+#        base_goal_vel = {k: v for k, v in action.items() if k.endswith(".vel")}
+#        ...
+#        self.bus.sync_write("Goal_Position", arm_goal_pos_raw)
+#    속도만 보내면 arm_goal_pos 가 빈 dict 이 되고, 빈 dict 로 sync_write 하다 예외가 난다.
+#    host 는 그 예외를 "Message fetching failed" 로 삼키고 **액션 전체를 버린다** → 바퀴도 안 돈다.
+#    2026-08-04 실측: 속도만 25회 전송 → host 예외 25건, 로봇 미동작.
+#                     팔 자세를 같이 보내니 예외 0건, 정상 주행.
+def _arm_hold(robot):
+    """현재 팔 자세(.pos)를 읽어 둔다 — 주행 중 이 자세를 유지시키는 용도."""
+    try:
+        obs = robot.get_observation()
+        return {k: float(v) for k, v in obs.items()
+                if isinstance(v, (int, float)) and k.startswith("arm_") and k.endswith(".pos")}
+    except Exception:
+        return {}
 
 
-def _stop(robot):
+def _send_base(robot, x=0.0, y=0.0, theta=0.0, arm=None):
+    act = dict(arm) if arm else {}
+    act.update({"x.vel": float(x), "y.vel": float(y), "theta.vel": float(theta)})
+    robot.send_action(act)
+
+
+def _stop(robot, arm=None):
+    if arm is None:
+        arm = _arm_hold(robot)
     for _ in range(3):
-        _send_base(robot, 0, 0, 0)
+        _send_base(robot, 0, 0, 0, arm)
         time.sleep(1.0 / FPS)
 
 
-def move_base(robot, x=0.0, y=0.0, theta=0.0, seconds=0.0, rec=None, ohcap=None):
-    """body 속도로 seconds 초 이동 후 정지."""
+def move_base(robot, x=0.0, y=0.0, theta=0.0, seconds=0.0, rec=None, ohcap=None, arm=None):
+    """body 속도로 seconds 초 이동 후 정지. arm 을 주면 그 자세를 유지한 채 주행한다."""
+    if arm is None:
+        arm = _arm_hold(robot)      # 매 펄스마다 읽으면 느리므로 시작 때 한 번만
     for i in range(max(1, int(seconds * FPS))):
-        _send_base(robot, x, y, theta)
+        _send_base(robot, x, y, theta, arm)
         if rec is not None and i % RECORD_STRIDE == 0:
             oh = None
             if ohcap is not None:
                 ok, f = ohcap.read(); oh = f if ok else None
             rec.add(robot.get_observation(), oh)
         time.sleep(1.0 / FPS)
-    _stop(robot)
+    _stop(robot, arm)
 
 
 def fwd(robot, direction, seconds, **kw):   # +1 전진 / -1 후진
@@ -228,12 +254,16 @@ def approach(robot, cal, y_tol=None, rec=None, ohcap=None, gui_win=None):
             cv2.imshow(gui_win, cv2.resize(bgr, (480, 360)))
             if (cv2.waitKey(1) & 0xFF) in (ord("q"), 27):
                 print("[approach] abort"); return False
+        # 주행 액션에 실어 보낼 현재 팔 자세 — 이미 읽은 obs 에서 뽑으므로 추가 통신이 없다.
+        arm = {k: float(v) for k, v in obs.items()
+               if isinstance(v, (int, float)) and k.startswith("arm_") and k.endswith(".pos")}
+
         if cx is None:
             n_miss += 1
             if time.time() - last_log > 1.5:
                 print(f"[approach] 손잡이 미검출 ({n_miss}회) — 시야에 없거나 HSV/조명 문제")
                 last_log = time.time()
-            _stop(robot); time.sleep(0.05); continue
+            _stop(robot, arm); time.sleep(0.05); continue
 
         last = (cx, cy)
         if first is None:
@@ -246,18 +276,18 @@ def approach(robot, cal, y_tol=None, rec=None, ohcap=None, gui_win=None):
             if time.time() - last_log > 1.5:
                 print(f"[approach] cx={cx}(목표 {cx0}, 차이 {dx:+d}) cy={cy} area={int(area)} → {act}")
                 last_log = time.time()
-            strafe(robot, -1 if cx < cx0 else +1, STEP)
+            strafe(robot, -1 if cx < cx0 else +1, STEP, arm=arm)
             continue
         # 2) 전후진
         if abs(dy) <= y_tol:
-            _stop(robot)
+            _stop(robot, arm)
             print(f"[approach] ✅ 도착 cx={cx}(목표 {cx0}) cy={cy}(목표 {cal['target_y']}) area={int(area)}")
             return True
         act = f"{'전진' if dy > 0 else '후진'}"
         if time.time() - last_log > 1.5:
             print(f"[approach] cx={cx}✓ cy={cy}(목표 {cal['target_y']}, 차이 {dy:+d}) area={int(area)} → {act}")
             last_log = time.time()
-        fwd(robot, +1 if cy > cal["target_y"] else -1, STEP)
+        fwd(robot, +1 if cy > cal["target_y"] else -1, STEP, arm=arm)
 
     _stop(robot)
     print(f"[approach] ⚠️ 타임아웃({APPROACH_TIMEOUT}s)")
