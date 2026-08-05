@@ -389,6 +389,12 @@ def preflight(args):
     where = "이 머신(로컬)" if csi_is_local(args) else args.csi_host
     print(f"[A] preflight: SO101 쪽 확인 — {where}")
 
+    # 폴딩 캠 배정은 LeKiwi 단계와 무관하다. 여기서 해야 --skip-task3(폴딩만)에서도 돈다.
+    # (처음엔 LeKiwi preflight 안에 뒀는데, --skip-task3 면 그게 통째로 건너뛰어져서
+    #  카메라가 배정되지 않은 채 폴딩이 시작됐다.)
+    if csi_is_local(args):
+        resolve_folding_cams(args)
+
     if csi_is_local(args):
         # SSH 를 돌 이유가 없다. 같은 것들을 로컬에서 직접 확인한다.
         ok = True
@@ -437,6 +443,10 @@ MOTOR_FAIL_MARKS = (
     "Missing motor IDs",
     "ConnectionError",
     "Failed to connect",
+    # 카메라도 같은 성격으로 '가끔' 안 잡힌다. 특히 앞 프로세스가 아직 장치를 놓지 않았을 때.
+    "could not be opened",
+    "device busy",
+    "Failed to open",
 )
 
 
@@ -446,6 +456,29 @@ def _looks_like_motor_failure(lines) -> str:
             if m in text:
                 return text.strip()[:160]
     return ""
+
+
+def _wait_cams_free(args, timeout=15.0):
+    """폴딩 캠 3대가 다시 열리는 상태가 될 때까지 기다린다.
+
+    앞 프로세스(prewarm 또는 직전 시도)가 카메라를 놓는 데 시간이 걸린다. 곧바로 새
+    프로세스를 띄우면 device busy 로 죽는다 — 재시도가 매번 같은 이유로 실패하게 된다.
+    """
+    if args.no_cam_resolve:
+        return True
+    try:
+        sys.path.insert(0, str(REPO / "examples" / "lekiwi"))
+        from resolve_cameras import LINKS, wait_released
+        devs = [str(LINKS / r) for r in ("top", "left_cam", "right_cam")
+                if (LINKS / r).exists()]
+        if not devs:
+            return True
+        ok = wait_released(devs, timeout=timeout, verbose=False)
+        if not ok:
+            print(f"  ⚠️ 카메라가 {timeout:.0f}초 안에 풀리지 않았습니다 — 그대로 진행합니다")
+        return ok
+    except Exception:
+        return True
 
 
 def run_csi(args):
@@ -459,6 +492,9 @@ def run_csi(args):
         if attempt > 1:
             print(f"\n  ↻ 재시도 {attempt}/{args.csi_retries} — {args.csi_retry_delay:.0f}초 후 다시 로딩")
             time.sleep(args.csi_retry_delay)
+        # 앞 시도가 카메라를 놓을 때까지 기다린다. 안 그러면 재시도가 매번
+        # device busy 로 같은 자리에서 실패한다.
+        _wait_cams_free(args)
         lines = []
         try:
             if local:
@@ -637,6 +673,37 @@ def ensure_jetson_host(args) -> bool:
     return False
 
 
+def resolve_folding_cams(args):
+    """폴딩 캠 3대를 모델+화면내용으로 배정한다. LeKiwi 단계와 무관하므로
+    --skip-task3(폴딩만 실행)에서도 반드시 돌아야 한다.
+    """
+    # 폴딩 캠 3대: udev 이름(/dev/lerobot/camera_N)은 '물리 포트'로 붙는다. 카메라 4대가
+    # 2쌍씩 벤더·모델·시리얼이 완전히 같아 udev 단서가 포트뿐이기 때문이다. 자리를 옮기면
+    # 이름이 뒤바뀐다(2026-08-05: 폴딩 top 이 세탁기 상공캠을 가리킨 채로 돌았다).
+    # 매 실행마다 모델+화면내용으로 다시 배정해 ~/.lerobot/cams/ 링크를 갱신한다.
+    if not args.no_cam_resolve:
+        try:
+            sys.path.insert(0, str(REPO / "examples" / "lekiwi"))
+            from resolve_cameras import (resolve as _resolve_cams,
+                                         wait_released as _wait_released,
+                                         write_links as _write_cam_links)
+            mapping, _cams, _why = _resolve_cams(verbose=False)
+            need = ("top", "left_cam", "right_cam")
+            if all(k in mapping for k in need):
+                _write_cam_links(mapping)
+                # 배정하느라 우리가 4대를 열었다 닫았다. V4L2 는 close 직후 곧바로
+                # 재오픈되지 않는 경우가 있어, 넘겨주기 전에 다시 열리는지 확인한다.
+                # (이걸 빼먹어 롤아웃이 device busy 로 죽는 일이 있었다)
+                _wait_released([mapping[k] for k in need], timeout=15.0, verbose=False)
+                print("  폴딩캠 : " + "  ".join(
+                    f"{k}→{os.path.basename(mapping[k])}" for k in need))
+            else:
+                print(f"  폴딩캠 : ⚠️ 배정 실패({', '.join(w for w in _why if '⚠️' in w) or '카메라 부족'})"
+                      " — 기존 /dev/lerobot/camera_N 으로 진행")
+        except Exception as e:
+            print(f"  폴딩캠 : ⚠️ 자동 배정 건너뜀({type(e).__name__}: {e}) — 기존 경로 사용")
+
+
 # ─────────────────────── [B] 로컬 task3 실행 ───────────────────────
 def local_preflight(args):
     """LeKiwi 쪽 장비 확인. 경로는 본체마다 다르므로 '없으면 경고'만 하고 진행 여부는 사용자가 정한다."""
@@ -646,26 +713,6 @@ def local_preflight(args):
     py = local_python()
     print(f"  python : {py}{'' if os.path.exists(py) else '  ✗ 없음'}")
     ok &= os.path.exists(py)
-
-    # 폴딩 캠 3대: udev 이름(/dev/lerobot/camera_N)은 '물리 포트'로 붙는다. 카메라 4대가
-    # 2쌍씩 벤더·모델·시리얼이 완전히 같아 udev 단서가 포트뿐이기 때문이다. 자리를 옮기면
-    # 이름이 뒤바뀐다(2026-08-05: 폴딩 top 이 세탁기 상공캠을 가리킨 채로 돌았다).
-    # 매 실행마다 모델+화면내용으로 다시 배정해 ~/.lerobot/cams/ 링크를 갱신한다.
-    if not args.no_cam_resolve:
-        try:
-            sys.path.insert(0, str(REPO / "examples" / "lekiwi"))
-            from resolve_cameras import resolve as _resolve_cams, write_links as _write_cam_links
-            mapping, _cams, _why = _resolve_cams(verbose=False)
-            need = ("top", "left_cam", "right_cam")
-            if all(k in mapping for k in need):
-                _write_cam_links(mapping)
-                print("  폴딩캠 : " + "  ".join(
-                    f"{k}→{os.path.basename(mapping[k])}" for k in need))
-            else:
-                print(f"  폴딩캠 : ⚠️ 배정 실패({', '.join(w for w in _why if '⚠️' in w) or '카메라 부족'})"
-                      " — 기존 /dev/lerobot/camera_N 으로 진행")
-        except Exception as e:
-            print(f"  폴딩캠 : ⚠️ 자동 배정 건너뜀({type(e).__name__}: {e}) — 기존 경로 사용")
 
     # 상공캠: 번호(/dev/videoN)는 본체마다·재연결마다 바뀌므로 실제로 프레임이 나오는 노드를 찾는다.
     print(f"  상공캠 : 탐색 중 (지정={args.overhead_cam}"
@@ -894,7 +941,19 @@ def main():
             else:
                 print("[C] ⚠️ 미리 띄운 수건개기 프로세스가 이미 종료됨 — 로그를 확인하세요")
             rc_csi = warm.follow("  ▸ ")
-            print("  ✅ 수건개기 완료" if rc_csi == 0 else f"  ✗ 수건개기 실패/중단 (exit {rc_csi})")
+            if rc_csi == 0:
+                print("  ✅ 수건개기 완료")
+            elif rc_csi == 130:
+                print("  ✗ 사용자 중단")
+            else:
+                # prewarm 경로에는 재시도가 없었다. 미리 띄워 둔 프로세스가 실패하면
+                # 그대로 끝나 버려서, 모터·카메라가 '가끔' 안 잡히는 것에 무방비였다.
+                # 여기서 run_csi 의 재시도 루프로 넘긴다. 넘기기 전에 그 프로세스를 확실히
+                # 죽여야 한다 — 살아 있으면 카메라를 쥔 채라 새 프로세스가 device busy 로 죽는다.
+                print(f"  ✗ 미리 띄운 프로세스 실패 (exit {rc_csi}) — 다시 로딩해 재시도합니다")
+                warm.stop("실패 — 재시도를 위해 정리")
+                _wait_cams_free(args)
+                rc_csi = run_csi(args)
         else:
             rc_csi = run_csi(args)
     except KeyboardInterrupt:

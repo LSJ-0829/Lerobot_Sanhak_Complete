@@ -58,8 +58,14 @@ def udev(dev: str, key: str) -> str:
     return ""
 
 
-def capture(dev: str, warmup: int = 12, tries: int = 30):
-    """프레임 한 장. 이 카메라들은 꽂은 직후 몇 프레임을 버려야 나온다."""
+def capture(dev: str, warmup: int = 10, tries: int = 40, delay: float = 0.08):
+    """프레임 한 장. 이 카메라들은 꽂은 직후/재열거 직후 몇 프레임을 버려야 나온다.
+
+    ⚠️ 재시도 사이에 반드시 쉬어야 한다. sleep 없이 read() 만 반복하면 실패가
+    수십 번 순식간에 지나가 버려 '프레임 없음'으로 오판한다(실제로 팔캠 한 대를
+    놓쳐 좌/우 배정이 실패했다). 실패 프레임은 거의 즉시 돌아온다.
+    """
+    import time as _t
     cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
@@ -71,6 +77,7 @@ def capture(dev: str, warmup: int = 12, tries: int = 30):
             got = f
             if i >= warmup:
                 break
+        _t.sleep(delay)
     cap.release()
     return got
 
@@ -162,14 +169,54 @@ def resolve(verbose=True):
     return result, cams, why
 
 
+ROLES = ("top", "left_cam", "right_cam", "overhead")
+
+
 def write_links(result):
+    """배정된 링크를 새로 만들고, 배정 못 한 역할의 '묵은 링크'는 지운다.
+
+    지우는 게 중요하다: /dev/videoN 번호는 재열거마다 바뀌어서, 남겨 두면 사라진 노드를
+    가리키는 링크가 된다. 그 상태로 열면 'device busy or missing' 으로 죽는데,
+    원인이 busy 인지 missing 인지 알기 어려워 진단이 오래 걸린다(실제로 겪음).
+    """
     LINKS.mkdir(parents=True, exist_ok=True)
-    for role, dev in result.items():
+    for role in ROLES:
         link = LINKS / role
+        dev = result.get(role)
         if link.is_symlink() or link.exists():
             link.unlink()
-        link.symlink_to(dev)
+        if dev:
+            link.symlink_to(dev)
     return LINKS
+
+
+def wait_released(devs, timeout=15.0, verbose=True):
+    """방금 우리가 열었던 카메라들이 '다시 열리는' 상태가 될 때까지 기다린다.
+
+    이걸 안 하면 배정 직후 롤아웃이 카메라를 열다 실패한다:
+        ConnectionError: ... could not be opened (device busy or missing)
+    V4L2 장치는 close() 직후 곧바로 재오픈되지 않는 경우가 있다. 측정하느라 우리가
+    열었던 것이 원인이므로, 넘겨주기 전에 여기서 확인하고 기다리는 게 맞다.
+    """
+    import time as _t
+    deadline = _t.time() + timeout
+    pending = list(devs)
+    while pending and _t.time() < deadline:
+        still = []
+        for d in pending:
+            cap = cv2.VideoCapture(d, cv2.CAP_V4L2)
+            ok = cap.isOpened()
+            cap.release()
+            if not ok:
+                still.append(d)
+        if not still:
+            pending = []
+            break
+        pending = still
+        _t.sleep(0.4)
+    if verbose and pending:
+        print(f"  ⚠️ 아직 열리지 않는 장치: {', '.join(pending)}")
+    return not pending
 
 
 def main():
