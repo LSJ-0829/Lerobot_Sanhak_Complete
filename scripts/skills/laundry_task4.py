@@ -337,10 +337,22 @@ class Prewarm:
         return self.p.returncode
 
 
-def local_csi_cmd(args):
-    """SSH 없이 로컬에서 돌릴 커맨드 (CWD=<csi_dir>/clothing)."""
+def local_csi_cmd(args, feed_enter=True):
+    """SSH 없이 로컬에서 돌릴 커맨드 (CWD=<csi_dir>/clothing).
+
+    feed_enter=True 면 `yes '' |` 로 빈 줄을 계속 흘려 넣는다. lerobot 은 팔마다
+      "Press ENTER to use provided calibration file ... or type 'c' to run calibration:"
+    을 물어보는데, 여기서 'c' 가 아닌 빈 줄은 '기존 캘리브레이션 파일을 쓴다'는 뜻이라
+    자동으로 넘겨도 안전하다(캘리브레이션을 새로 하지 않는다).
+    prewarm 경로는 이미 이렇게 하고 있었는데 --skip-task3 로 직접 실행하는 경로에는
+    빠져 있어서, 그 경우에만 사람이 엔터를 쳐야 했다.
+    """
     py = os.path.expanduser(args.csi_python)
-    return [py, *shlex.split(args.csi_cmd)], os.path.join(os.path.expanduser(args.csi_dir), "clothing")
+    cwd = os.path.join(os.path.expanduser(args.csi_dir), "clothing")
+    if not feed_enter:
+        return [py, *shlex.split(args.csi_cmd)], cwd
+    inner = f"{shlex.quote(py)} {args.csi_cmd}"
+    return ["bash", "-c", f"yes '' | PYTHONUNBUFFERED=1 {inner}"], cwd
 
 
 def start_prewarm(args):
