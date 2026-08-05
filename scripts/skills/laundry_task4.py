@@ -145,7 +145,7 @@ def local_python() -> str:
     return str(cand) if cand.exists() else sys.executable
 
 
-def run_streaming(cmd, prefix, cwd=None, env=None, show=None):
+def run_streaming(cmd, prefix, cwd=None, env=None, show=None, sink=None):
     """자식 프로세스 출력을 prefix 붙여 실시간으로 흘리고 returncode 를 돌려준다.
 
     줄 단위로만 읽으면 안 된다: input() 의 프롬프트는 줄바꿈이 없어서 버퍼에 갇히고,
@@ -153,6 +153,7 @@ def run_streaming(cmd, prefix, cwd=None, env=None, show=None):
     그래서 출력이 잠시 멎으면(=상대가 입력을 기다리는 상태) 남은 조각을 그대로 내보낸다.
 
     show 를 주면 그 문자열을 대신 표시한다(ssh 원격 스크립트는 따옴표 때문에 원문이 읽기 어렵다).
+    sink 를 주면(list) 흘려보낸 텍스트를 거기에도 쌓는다 — 실패 사유를 사후에 판정하려고.
     """
     print(f"  $ {show or ' '.join(shlex.quote(c) for c in cmd)}", flush=True)
     p = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE,
@@ -164,7 +165,10 @@ def run_streaming(cmd, prefix, cwd=None, env=None, show=None):
         nonlocal buf
         while b"\n" in buf:
             line, buf = buf.split(b"\n", 1)
-            print(f"{prefix}{line.decode('utf-8', 'replace').rstrip()}", flush=True)
+            text = line.decode("utf-8", "replace").rstrip()
+            if sink is not None:
+                sink.append(text)
+            print(f"{prefix}{text}", flush=True)
 
     try:
         while True:
@@ -420,23 +424,74 @@ def preflight(args):
     return False
 
 
+# 모터가 '가끔 이유 없이' 인식되지 않는다. 하드웨어 고장이 아니라 버스가 아직 정리되지
+# 않은 상태에서 연결을 시도해 생기는 일이라, 다시 띄우면 대개 그냥 된다(실측 확인:
+# 실패 직후 1~6번 전부 정상 응답). 아래 흔적이 보이면 프로세스를 통째로 다시 띄운다.
+# 연결 호출 하나만 감싸지 않고 프로세스를 재시작하는 이유: 실패 지점이 rollout.py 일 수도
+# setup_devices.py 일 수도 있어서(실제로 후자에서 터졌다), 지점을 특정하지 않는 편이 확실하다.
+MOTOR_FAIL_MARKS = (
+    "no status packet",
+    "Failed to write",
+    "Failed to sync read",
+    "motor check failed",
+    "Missing motor IDs",
+    "ConnectionError",
+    "Failed to connect",
+)
+
+
+def _looks_like_motor_failure(lines) -> str:
+    for text in reversed(lines[-400:]):
+        for m in MOTOR_FAIL_MARKS:
+            if m in text:
+                return text.strip()[:160]
+    return ""
+
+
 def run_csi(args):
     print("─" * 60)
-    if csi_is_local(args):
-        cmd, cwd = local_csi_cmd(args)
-        print(f"[C] SO101 수건개기(로컬): {cwd} 에서 `{args.csi_cmd}`")
-        rc = run_streaming(cmd, "  ▸ ", cwd=cwd)
-    else:
-        print(f"[C] SO101 수건개기: {args.csi_host}:{args.csi_dir}/clothing 에서 `{args.csi_cmd}`")
-        tty = sys.stdin.isatty() and not args.no_tty
-        rc = run_streaming(ssh_cmd(args, remote_script(args), tty=tty), "  ▸ ",
-                           show=f"ssh {args.csi_host} 'cd {args.csi_dir}/clothing && "
-                                f"{args.csi_python} {args.csi_cmd}'")
-    if rc == 0:
-        print("  ✅ 수건개기 완료")
-    else:
-        print(f"  ✗ 수건개기 실패/중단 (exit {rc})")
+    local = csi_is_local(args)
+    where = (f"{cwd_of(args)} 에서" if local
+             else f"{args.csi_host}:{args.csi_dir}/clothing 에서")
+    print(f"[C] SO101 수건개기{'(로컬)' if local else ''}: {where} `{args.csi_cmd}`")
+
+    for attempt in range(1, args.csi_retries + 1):
+        if attempt > 1:
+            print(f"\n  ↻ 재시도 {attempt}/{args.csi_retries} — {args.csi_retry_delay:.0f}초 후 다시 로딩")
+            time.sleep(args.csi_retry_delay)
+        lines = []
+        try:
+            if local:
+                cmd, cwd = local_csi_cmd(args)
+                rc = run_streaming(cmd, "  ▸ ", cwd=cwd, sink=lines)
+            else:
+                tty = sys.stdin.isatty() and not args.no_tty
+                rc = run_streaming(ssh_cmd(args, remote_script(args), tty=tty), "  ▸ ",
+                                   show=f"ssh {args.csi_host} 'cd {args.csi_dir}/clothing && "
+                                        f"{args.csi_python} {args.csi_cmd}'", sink=lines)
+        except KeyboardInterrupt:
+            raise
+
+        if rc == 0:
+            print(f"  ✅ 수건개기 완료{'' if attempt == 1 else f' ({attempt}번째 시도)'}")
+            return 0
+        if rc == 130:
+            print("  ✗ 사용자 중단")
+            return rc
+
+        why = _looks_like_motor_failure(lines)
+        if not why:
+            print(f"  ✗ 수건개기 실패/중단 (exit {rc}) — 모터 인식 실패가 아니라 재시도하지 않습니다")
+            return rc
+        print(f"  ✗ 모터 인식 실패 (exit {rc}): {why}")
+        if attempt == args.csi_retries:
+            print(f"  ✗ {args.csi_retries}회 모두 실패 — 팔 전원/USB 케이블을 확인하세요")
+            return rc
     return rc
+
+
+def cwd_of(args):
+    return os.path.join(os.path.expanduser(args.csi_dir), "clothing")
 
 
 # ─────────────────────── Jetson 자동 준비 ───────────────────────
@@ -708,6 +763,10 @@ def main():
                     help="6번 순응제어 레지스터(P게인·토크상한) 자동 설정 안 함")
     ap.add_argument("--no-cam-resolve", action="store_true",
                     help="폴딩 캠 자동 배정 안 함(udev 이름을 그대로 씀)")
+    ap.add_argument("--csi-retries", type=int, default=int(os.environ.get("CSI_RETRIES", "10")),
+                    help="모터 인식 실패 시 수건개기 프로세스를 다시 띄울 최대 횟수(기본 10). env CSI_RETRIES")
+    ap.add_argument("--csi-retry-delay", type=float, default=float(os.environ.get("CSI_RETRY_DELAY", "5")),
+                    help="재시도 전 대기 초(기본 5). 버스가 정리될 시간을 준다. env CSI_RETRY_DELAY")
     ap.add_argument("--handoff-motion", default=HANDOFF_MOTION,
                     help="마지막 후퇴 뒤 재생할 전달 모션 이름(motions/<이름>.json). 비우면 생략. env HANDOFF_MOTION")
     ap.add_argument("--check", action="store_true", help="preflight 만 하고 종료(로봇 안 움직임)")

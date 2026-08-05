@@ -18,6 +18,11 @@ import sys
 TARGET = pathlib.Path("/home/lerobot/lerobot2/csi-agent/lhwdev/clothing/rollout.py")
 BACKUP = TARGET.with_suffix(".py.bak.motorretry")
 
+# 참고: setup_devices.py:76 의 robot.connect() 는 여기서 감싸지 않는다.
+#   실제 시연에서 터진 건 그쪽이었지만(ConnectionError: no status packet on id_=3),
+#   남의 파일을 여러 군데 고치는 대신 laundry_task4 가 rollout 프로세스 자체를
+#   최대 10회 재시작하도록 했다. 실패 지점이 어디든 덮이고 되돌리기도 쉽다.
+
 ANCHOR = "from lerobot.robots import make_robot_from_config"
 
 HELPER = '''
