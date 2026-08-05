@@ -52,6 +52,7 @@ import argparse
 import json
 import math
 import os
+import re
 import select
 import shlex
 import signal
@@ -396,8 +397,11 @@ def preflight(args):
     # 있으면 그 화면이 달라져 배정이 흔들린다. 자세를 고정해 놓고 봐야 재현된다.
     # 실패하면 preflight 를 통과시키지 않는다 — Enter 를 받기 전에 멈춰야
     # '수건은 전달됐는데 폴딩이 안 되는' 상황을 피할 수 있다.
+    # 모델 확인이 맨 앞이다: 로봇을 건드리지 않고 즉시 끝나므로, 파일이 문제면
+    # 팔을 움직이기도 전에 멈추는 게 낫다.
     pre_ok = True
     if csi_is_local(args):
+        pre_ok &= check_models(args)
         pre_ok &= home_arms(args)
         pre_ok &= resolve_folding_cams(args)
 
@@ -420,7 +424,7 @@ def preflight(args):
             ok &= p.exists()
         if ok:
             if not pre_ok:
-                print("  ✗ preflight 실패 — 홈 자세/카메라 배정 확인")
+                print("  ✗ preflight 실패 — 모델 파일/홈 자세/카메라 배정 확인")
                 return False
             print("  ✅ preflight OK")
         else:
@@ -704,6 +708,125 @@ def ensure_jetson_host(args) -> bool:
     for line in log.strip().splitlines()[-8:]:
         print(f"             {line}")
     return False
+
+
+# ─────────────────────── 모델 파일 확인 ───────────────────────
+# 모델은 lhwdev 계정이 학습·복사하고 우리는 lerobot 으로 읽기만 한다. 복사 방식에 따라
+# 원본 권한이 그대로 따라와 lerobot 이 못 읽는 일이 생긴다(2026-08-05 classifier 가
+# -rw------- 로 들어와 롤아웃이 죽었다. train/ 에 default ACL 이 걸려 있지만
+# cp -p / rsync -a 는 그 기본값을 덮어써서 재발할 수 있다).
+# 폴딩은 파이프라인의 '끝'이라, 여기서 실패하면 수건을 이미 전달받은 뒤다. 그래서
+# Enter 를 받기 전에 5개 모델을 전부 확인한다.
+CLASSIFIER_REL = "train/towel_fold01_nextlevel"
+MODEL_FILES = ("config.json", "model.safetensors")
+
+
+def _safetensors_ok(p: Path) -> str:
+    """safetensors 가 '끝까지' 있는지 본다. 헤더에 적힌 마지막 오프셋과 실제 크기를 비교.
+
+    복사가 중간에 끊긴 파일은 열리기는 하고 로드할 때야 터진다. 실제로 train/ 아래에
+    model.safetensors.tmp 가 남아 있던 적이 있어서(2026-08-05) 크기까지 확인한다.
+    빈 문자열이면 정상, 아니면 사유.
+    """
+    try:
+        with p.open("rb") as f:
+            n = int.from_bytes(f.read(8), "little")
+            if n <= 0 or n > 100_000_000:
+                return f"헤더 길이가 이상함({n})"
+            head = json.loads(f.read(n).decode("utf-8"))
+        end = max((v["data_offsets"][1] for v in head.values()
+                   if isinstance(v, dict) and "data_offsets" in v), default=0)
+        want, have = 8 + n + end, p.stat().st_size
+        if want != have:
+            return f"잘림 — {have:,}바이트인데 {want:,}바이트여야 함"
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+    return ""
+
+
+def _make_readable(p: Path) -> bool:
+    """읽을 수 있게 만든다. 파일 주인이 우리가 아니면 chmod 가 안 되니 sudo -n 도 시도한다.
+    (-n 이라 비밀번호를 물으며 멈추지 않는다 — 안 되면 그냥 실패로 두고 사람에게 알린다)"""
+    for fn in (
+        lambda: os.chmod(p, p.stat().st_mode | 0o444),
+        lambda: subprocess.run(["sudo", "-n", "chmod", "a+r", str(p)],
+                               check=True, capture_output=True, timeout=10),
+    ):
+        try:
+            fn()
+            if os.access(p, os.R_OK):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _model_paths(args):
+    """rollout_auto.py 가 실제로 여는 경로를 그대로 계산한다(하드코딩하지 않는다).
+    --no_step0 이면 step0 은 아예 안 열리므로 확인 대상에서도 뺀다."""
+    cdir = Path(os.path.expanduser(args.csi_dir)) / "clothing"
+    name, idxs = "towel_fold01", [0, 1, 2, 3]
+    info = cdir / "clothing_info.py"
+    try:
+        src = info.read_text()
+        m = re.search(r'clothing_name\s*=\s*"([^"]+)"', src)
+        if m:
+            name = m.group(1)
+        found = sorted({int(i) for i in re.findall(r'_step(\d+)"', src)})
+        if found:
+            idxs = found
+    except Exception:
+        pass  # 못 읽으면 기본값으로 진행 — 경로가 틀리면 어차피 아래에서 '없음' 으로 잡힌다
+    start = 1 if "--no_step0" in args.csi_cmd else 0
+    out = [(f"step{i}", cdir.parent / "train" / f"rollout_hil_{name}_step{i}" / "checkpoints" / "last")
+           for i in idxs if i >= start]
+    out.append(("classifier", cdir.parent / CLASSIFIER_REL))
+    return out
+
+
+def check_models(args) -> bool:
+    ok = True
+    print("  모델    : 폴딩 정책/분류기 파일 확인")
+    for label, d in _model_paths(args):
+        # checkpoints/last 는 심볼릭 링크다. 학습을 다시 돌리면 없는 번호를 가리킨 채
+        # 남아 있는 일이 있다(실제로 step0 이 지워진 074740 을 가리키고 있었다).
+        if d.is_symlink() and not d.exists():
+            print(f"           ✗ {label}: 링크가 끊김 {d.name} → {os.readlink(d)}")
+            ok = False
+            continue
+        if not d.is_dir():
+            print(f"           ✗ {label}: 경로 없음 {d}")
+            ok = False
+            continue
+        bad = []
+        for fn in MODEL_FILES:
+            f = d / fn
+            if not f.exists():
+                bad.append(f"{fn} 없음")
+                continue
+            if not os.access(f, os.R_OK):
+                if _make_readable(f):
+                    print(f"           ⚠️ {label}/{fn}: 읽기 권한이 없어 a+r 로 고쳤습니다")
+                else:
+                    st = f.stat()
+                    bad.append(f"{fn} 읽기 불가 (mode={oct(st.st_mode)[-4:]} uid={st.st_uid})")
+                    continue
+            if fn.endswith(".safetensors"):
+                why = _safetensors_ok(f)
+                if why:
+                    bad.append(f"{fn} {why}")
+        if bad:
+            ok = False
+            for b in bad:
+                print(f"           ✗ {label}: {b}")
+        else:
+            tgt = os.readlink(d) if d.is_symlink() else d.name
+            size = (d / "model.safetensors").stat().st_size
+            print(f"           {label:<10} OK  ({tgt}, {size / 1e6:.0f}MB)")
+    if not ok:
+        print("           소유자가 다른 계정이라 못 고치는 경우 본체에서:")
+        print("             sudo chmod -R a+rX /home/lerobot/lerobot2/csi-agent/lhwdev/train")
+    return ok
 
 
 IDLE_POSTURE = "idle_posture.json"
