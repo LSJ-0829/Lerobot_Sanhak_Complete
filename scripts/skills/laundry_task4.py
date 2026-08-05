@@ -84,8 +84,32 @@ LOCAL_PYTHON = os.environ.get("LEROBOT_PYTHON", "")
 DEFAULT_TASK3 = REPO / "scripts" / "skills" / "laundry_task3.py"
 OVERHEAD_CAM = os.environ.get("OVERHEAD_CAM", "auto")
 OVERHEAD_MATCH = os.environ.get("OVERHEAD_MATCH", "")  # 캠이 여러 개일 때 이름으로 좁히기
-JETSON_IP = os.environ.get("REMOTE_IP", "")           # 비우면 task3 의 --wireless/기본값에 맡김
+JETSON_IP = os.environ.get("REMOTE_IP", "192.168.55.1")  # 유선 USB 링크 기본값. --wireless 는 task3 쪽
 HANDOFF_MOTION = os.environ.get("HANDOFF_MOTION", "")  # motions/<이름>.json, 비우면 전달 모션 생략
+
+# Jetson 자동 준비 — 아무 인자 없이 `python laundry_task4.py` 만 쳐도 되게 하는 값들.
+#   JETSON_USER  : Jetson 로그인 계정(홈이 /home/<user>). 키 인증이 걸려 있어야 한다.
+#   USBNET_UNIT  : USB 이더넷 정적 IP 를 붙이는 systemd unit. IP 가 없을 때만 재시작한다.
+JETSON_USER = os.environ.get("JETSON_USER", "comnet02")
+USBNET_UNIT = os.environ.get("USBNET_UNIT", "lekiwi-usbnet.service")
+HOST_PORTS = (5555, 5556)
+
+# Jetson 에 심어두는 host 자동 재기동 래퍼.
+#   host 는 클라이언트가 연결을 끊으면 함께 종료된다 → 매 실행마다 사람이 다시 띄워야 했다.
+#   이 래퍼가 죽을 때마다 3초 뒤 다시 올려서 그 수고를 없앤다(systemd Restart=always 대용, sudo 불필요).
+KEEPALIVE_PATH = "~/lekiwi_host_keepalive.sh"
+KEEPALIVE_SH = r"""#!/bin/bash
+# lekiwi_host 자동 재기동 래퍼 (laundry_task4.py 가 생성/관리).
+cd "$HOME/lerobot" || exit 1
+PY="$HOME/miniforge3/envs/lerobot/bin/python"
+while true; do
+  echo "[keepalive] $(date +%F' '%T) host 기동" >> "$HOME/lekiwi_host.log"
+  "$PY" -m lerobot.robots.lekiwi.lekiwi_host \
+      --robot.id=my_awesome_kiwi --host.connection_time_s=7200 >> "$HOME/lekiwi_host.log" 2>&1
+  echo "[keepalive] $(date +%F' '%T) host 종료(코드 $?) — 3초 후 재기동" >> "$HOME/lekiwi_host.log"
+  sleep 3
+done
+"""
 
 SSH_OPTS = ["-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4"]
 
@@ -380,6 +404,93 @@ def run_csi(args):
     return rc
 
 
+# ─────────────────────── Jetson 자동 준비 ───────────────────────
+def _ping(ip, timeout=2) -> bool:
+    return subprocess.run(["ping", "-c", "1", "-W", str(timeout), ip],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+
+def _port_open(ip, port, timeout=2) -> bool:
+    import socket
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _jetson_ssh(args, script, timeout=25):
+    """Jetson 에 짧은 명령 실행. (rc, stdout) 반환."""
+    cmd = ["ssh", *SSH_OPTS, "-o", "BatchMode=yes",
+           f"{args.jetson_user}@{args.jetson_ip}", "bash -s"]
+    try:
+        p = subprocess.run(cmd, input=script, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
+    except subprocess.TimeoutExpired:
+        return 124, "timeout"
+
+
+def ensure_jetson_link(args) -> bool:
+    """유선 USB 링크가 죽어 있으면 정적 IP 서비스를 다시 올린다.
+
+    Jetson 이 USB 를 재열거하면(케이블 흔들림·재부팅) 정적 IP 가 날아가는데, 그 서비스는
+    oneshot 이라 스스로 복구하지 않는다. 여기서 한 번 되살려 본다.
+    ⚠️ 이 서비스는 enx* 만 건드리고 본체 인터넷 회선(enp2s0)은 손대지 않는다.
+    """
+    if _ping(args.jetson_ip):
+        return True
+    print(f"  Jetson : {args.jetson_ip} 응답 없음 → {args.usbnet_unit} 재시작 시도")
+    r = subprocess.run(["sudo", "-n", "systemctl", "restart", args.usbnet_unit],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        print("           ✗ 무암호 sudo 가 없어 자동 복구 불가. 본체 터미널에서:")
+        print(f"             sudo systemctl restart {args.usbnet_unit}")
+        return False
+    time.sleep(3)
+    if _ping(args.jetson_ip):
+        print("           ✅ 링크 복구됨")
+        return True
+    print("           ✗ 여전히 응답 없음 — Jetson 전원/USB 케이블 확인")
+    return False
+
+
+def ensure_jetson_host(args) -> bool:
+    """lekiwi_host 가 안 떠 있으면 Jetson 에 접속해 keepalive 래퍼로 띄운다."""
+    if all(_port_open(args.jetson_ip, p) for p in HOST_PORTS):
+        print(f"  host   : {args.jetson_ip}:{HOST_PORTS[0]}/{HOST_PORTS[1]} 리슨 중")
+        return True
+
+    print("  host   : 안 떠 있음 → Jetson 에서 기동")
+    # 래퍼가 없거나 내용이 바뀌었으면 새로 심는다(멱등).
+    rc, out = _jetson_ssh(args, f"cat > {KEEPALIVE_PATH} <<'__EOF__'\n{KEEPALIVE_SH}__EOF__\n"
+                                f"chmod +x {KEEPALIVE_PATH} && echo ok")
+    if rc != 0:
+        print(f"           ✗ Jetson SSH 실패(rc={rc}): {out.strip()[:200]}")
+        print(f"           ssh {args.jetson_user}@{args.jetson_ip} 키 인증이 되는지 확인하세요.")
+        return False
+
+    # 기존 래퍼가 떠 있으면(포트는 아직 안 열린 과도기) 중복 기동하지 않는다.
+    rc, out = _jetson_ssh(
+        args,
+        f"if pgrep -f '[l]ekiwi_host_keepalive.sh' > /dev/null; then echo already; else "
+        f"setsid nohup {KEEPALIVE_PATH} > /dev/null 2>&1 < /dev/null & echo launched; fi")
+    if rc != 0:
+        print(f"           ✗ 기동 실패(rc={rc}): {out.strip()[:200]}")
+        return False
+    print(f"           {'이미 실행 중' if 'already' in out else '기동함'} — 리슨 대기")
+
+    for i in range(30):
+        if all(_port_open(args.jetson_ip, p, timeout=1) for p in HOST_PORTS):
+            print(f"           ✅ host 준비됨 ({i + 1}초)")
+            return True
+        time.sleep(1)
+    _, log = _jetson_ssh(args, "tail -15 ~/lekiwi_host.log 2>&1")
+    print("           ✗ 30초 내 리슨 안 함. Jetson 로그 마지막:")
+    for line in log.strip().splitlines()[-8:]:
+        print(f"             {line}")
+    return False
+
+
 # ─────────────────────── [B] 로컬 task3 실행 ───────────────────────
 def local_preflight(args):
     """LeKiwi 쪽 장비 확인. 경로는 본체마다 다르므로 '없으면 경고'만 하고 진행 여부는 사용자가 정한다."""
@@ -406,11 +517,14 @@ def local_preflight(args):
         ok = False
         print("           ✗ 상공 카메라를 못 찾음 (USB 연결 확인)")
 
+    # Jetson: 링크 → host 순으로 '확인하고, 안 되면 되살린다'. 사람이 미리 띄워둘 필요가 없다.
     if args.jetson_ip:
-        r = subprocess.run(["ping", "-c", "1", "-W", "2", args.jetson_ip],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        print(f"  Jetson : {args.jetson_ip}  {'OK' if r.returncode == 0 else '✗ 응답 없음'}")
-        ok &= r.returncode == 0
+        link = ensure_jetson_link(args)
+        if link:
+            print(f"  Jetson : {args.jetson_ip}  OK")
+            ok &= ensure_jetson_host(args) if not args.no_host_autostart else True
+        else:
+            ok = False
     else:
         print("  Jetson : (미지정 — task3 기본값/--wireless 에 맡김)")
 
@@ -473,6 +587,12 @@ def main():
     ap.add_argument("--jetson-ip", default=JETSON_IP,
                     help="LeKiwi Jetson IP. ⚠️ 본체/네트워크마다 다름(유선 192.168.55.1 / 무선 192.168.0.19). "
                          "비우면 task3 기본값·--wireless 를 따름. env REMOTE_IP")
+    ap.add_argument("--jetson-user", default=JETSON_USER,
+                    help="Jetson 로그인 계정(host 자동 기동용, 키 인증 필요). env JETSON_USER")
+    ap.add_argument("--usbnet-unit", default=USBNET_UNIT,
+                    help="USB 이더넷 정적 IP systemd unit — Jetson 이 ping 에 응답 안 할 때만 재시작. env USBNET_UNIT")
+    ap.add_argument("--no-host-autostart", action="store_true",
+                    help="lekiwi_host 자동 기동 안 함(이미 직접 띄운 경우)")
     ap.add_argument("--handoff-motion", default=HANDOFF_MOTION,
                     help="마지막 후퇴 뒤 재생할 전달 모션 이름(motions/<이름>.json). 비우면 생략. env HANDOFF_MOTION")
     ap.add_argument("--check", action="store_true", help="preflight 만 하고 종료(로봇 안 움직임)")
