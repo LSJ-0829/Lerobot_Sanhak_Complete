@@ -1,9 +1,15 @@
 {
   "_comment": "approach_then_center_black.py 1단계(세탁기 빨간 손잡이 접근) 파라미터. 재학습/조정 시 이 파일만 수정하면 됨(스크립트 수정 불필요).",
-  "_measured": "2026-08-04 재측정(시연 본체, 도착 위치에서 80프레임): cx=346, cy=17, area median=2466 (cx/cy 표준편차 0.0). 경로=lerobot obs['front'] 경유, front=640x480 NO_ROTATION. 이전 값(2026-06-30, cx=282 cy=22 area=3536)은 Jetson 직접 cv2 캡처로 측정한 것.",
-  "TARGET_Y": 17,
-  "AREA_THRESHOLD": 2219,
-  "CENTER_X": 346,
+  "_measured": "2026-06-30 원본 값으로 롤백(2026-08-05). 2026-08-04 에 시연 본체 도착 위치에서 재측정한 값(cx=346 cy=17 area=2219)을 넣었더니 문 열기 접근이 전보다 멀리 떨어져 멈췄다 → 검증된 원본(cx=282 cy=22 area=3182)으로 되돌린다. 재측정본이 필요하면 _measured_20260804 참고.",
+  "_measured_20260804": {
+    "TARGET_Y": 17,
+    "AREA_THRESHOLD": 2219,
+    "CENTER_X": 346,
+    "note": "시연 본체 도착 위치 80프레임, lerobot obs['front'] 경유, 640x480 NO_ROTATION. 실기에서 접근 거리가 멀어져 미채택."
+  },
+  "TARGET_Y": 22,
+  "AREA_THRESHOLD": 3182,
+  "CENTER_X": 282,
   "DEAD_ZONE_X": 50,
   "DETECT_AREA_MIN": 300,
   "WHEEL_SPEED": 600,

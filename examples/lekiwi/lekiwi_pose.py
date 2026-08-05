@@ -99,6 +99,8 @@ def move_to_pose(
     fps: int = 30,
     verbose: bool = True,
     hold_gripper: bool = False,
+    settle_s: float = 2.0,
+    settle_tol: float = 1.5,
 ) -> None:
     """현재 자세 → 목표 포즈로 선형 보간해 천천히 이동한다.
 
@@ -151,7 +153,42 @@ def move_to_pose(
                 print(f"[포즈] leader send_feedback 실패(무시): {e}")
         time.sleep(1.0 / fps)
 
-    if verbose:
+    # ── 도달 대기 ──────────────────────────────────────────────────────────
+    # 보간 웨이포인트를 다 보냈다고 팔이 거기 있는 건 아니다. 모터에 Goal_Velocity
+    # 상한(800)과 Acceleration(40)이 걸려 있어 마지막 목표까지 따라오는 데 시간이
+    # 걸린다(감속 구간만 ~0.2s). 예전엔 Goal_Velocity=0(무제한)이라 즉시 도달해
+    # 이 문제가 안 보였는데, 끊김을 없애려 속도를 제한하면서 드러났다.
+    # 확인 없이 반환하면 '지정 자세가 아닌 채로' 다음 단계(접근·문열기)가 시작된다.
+    if robot is not None and settle_s > 0:
+        deadline = time.time() + settle_s
+        worst_j, worst = None, 0.0
+        while time.time() < deadline:
+            goal = {k: action[k] for k in arm_keys}
+            goal.update({k: 0.0 for k in BASE_KEYS})
+            try:
+                robot.send_action(goal)       # 목표를 계속 눌러 준다
+            except Exception:
+                pass
+            time.sleep(1.0 / fps)
+            try:
+                obs = robot.get_observation()
+            except Exception:
+                continue
+            worst_j, worst = None, 0.0
+            for k in arm_keys:
+                if k not in obs:
+                    continue
+                err = abs(float(obs[k]) - action[k])
+                if err > worst:
+                    worst_j, worst = k, err
+            if worst <= settle_tol:
+                break
+        if worst > settle_tol:
+            print(f"[포즈] ⚠️ {settle_s:.1f}s 안에 도달 못함 — 최대 오차 "
+                  f"{worst:.1f}({worst_j}). duration 을 늘리거나 Goal_Velocity 를 올릴 것")
+        elif verbose:
+            print(f"[포즈] 도달 (최대 오차 {worst:.2f})")
+    elif verbose:
         print("[포즈] 도달")
 
 
