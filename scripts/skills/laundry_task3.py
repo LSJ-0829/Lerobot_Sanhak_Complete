@@ -305,6 +305,48 @@ def compliant_grip(robot, close_pos=None, rec=None, ohcap=None):
     return gripped_at
 
 
+def release_gripper(robot, target, seconds=1.2, rec=None, ohcap=None, tol=1.5):
+    """그리퍼만 target(정규화 .pos)까지 벌린다. 나머지 관절은 현재 자세 유지.
+
+    순응 물기로 문 상태의 그리퍼는 목표가 '물린 위치'로 고정돼 있다. 그대로 팔을 움직이면
+    손잡이를 문 채 빠져나가므로, 팔보다 '먼저' 벌려야 한다(원본 return_home order="6;2").
+    도달까지 확인한다 — 안 벌어진 채 다음 단계로 넘어가면 문을 다시 끌고 간다.
+    """
+    if target is None:
+        print("[grip] ⚠️ 복귀 자세에 그리퍼 값이 없어 벌리기 생략")
+        return False
+    obs = robot.get_observation()
+    arm = {k: float(v) for k, v in obs.items()
+           if isinstance(v, (int, float)) and k.startswith("arm_") and k.endswith(".pos")}
+    start = arm.get("arm_gripper.pos", 0.0)
+    print(f"[grip] 그리퍼 벌리기: {start:.1f} → {target:.1f}")
+
+    n = max(1, int(seconds * FPS))
+    for i in range(1, n + 1):
+        g = dict(arm)
+        g["arm_gripper.pos"] = start + (target - start) * (i / n)
+        g.update({"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0})
+        robot.send_action(g)
+        if rec is not None and i % RECORD_STRIDE == 0:
+            rec.add(robot.get_observation(), (ohcap.read()[1] if ohcap else None))
+        time.sleep(1.0 / FPS)
+
+    # 도달 확인 — Goal_Velocity 상한 때문에 마지막 오차가 남을 수 있다.
+    deadline = time.time() + 2.0
+    pos = start
+    while time.time() < deadline:
+        g = dict(arm); g["arm_gripper.pos"] = target
+        g.update({"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0})
+        robot.send_action(g)
+        time.sleep(1.0 / FPS)
+        pos = float(robot.get_observation().get("arm_gripper.pos", pos))
+        if abs(pos - target) <= tol:
+            print(f"[grip]   ✅ 벌림 완료 ({pos:.1f})")
+            return True
+    print(f"[grip]   ⚠️ 벌림 미달: {pos:.1f} (목표 {target:.1f}) — 손잡이에 걸렸을 수 있음")
+    return False
+
+
 def replay_motion(robot, name, rec=None, ohcap=None):
     """motions/<name>.json(raw frames) 을 ZMQ 로 재생(정규화 액션 순차 전송)."""
     path = REPO / "motions" / f"{name}.json"
@@ -504,8 +546,16 @@ def open_door(robot, poses, rec=None, ohcap=None):
     _stop(robot)
 
     # laundry_back 자세 → 시작 위치 상쇄 주행(net strafe/drive)
+    # 문을 당겨 연 뒤에는 손잡이를 '놓아야' 한다. hold_gripper=True 면 포즈의 그리퍼
+    # 목표(laundry_back=2233, 벌림)를 무시하고 현재(닫힘) 위치를 유지해 계속 물고 있게 된다.
+    # hold_gripper 는 수건을 쥔 채 팔만 복귀시킬 때 쓰는 옵션이지, 여기선 반대다.
+    # 원본 open_door2 도 return_home 을 order="6;2" 로 불러 6번(그리퍼)을 '먼저' 벌린다.
+    # 순서도 원본을 따른다: 그리퍼를 '먼저' 벌리고(order 의 6), 그 다음 팔을 움직인다.
+    # 동시에 움직이면 아직 손잡이를 문 채로 팔이 빠져나가며 문/손잡이를 잡아챈다.
+    release_gripper(robot, poses[BACK_POSE].get("arm_gripper.pos"), rec=rec, ohcap=ohcap)
+
     print(f"[door] 복귀 자세 '{BACK_POSE}' + 시작 위치 상쇄")
-    move_to_pose(poses[BACK_POSE], robot=robot, duration=HOME_DURATION, fps=FPS, hold_gripper=True)
+    move_to_pose(poses[BACK_POSE], robot=robot, duration=HOME_DURATION, fps=FPS, hold_gripper=False)
     net_strafe = OPEN_STRAFE_SEC              # 오른쪽으로 간 것
     net_drive = OPEN_FORWARD_SEC - BACKDRIVE_SEC  # +면 순전진
     strafe(robot, -1 if net_strafe > 0 else +1, abs(net_strafe), rec=rec, ohcap=ohcap)
