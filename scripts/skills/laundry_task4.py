@@ -456,11 +456,20 @@ MOTOR_FAIL_MARKS = (
     "Missing motor IDs",
     "ConnectionError",
     "Failed to connect",
-    # 카메라도 같은 성격으로 '가끔' 안 잡힌다. 특히 앞 프로세스가 아직 장치를 놓지 않았을 때.
+)
+
+# 카메라도 같은 성격으로 '가끔' 안 잡힌다. 앞 프로세스가 아직 장치를 놓지 않았거나,
+# USB 에는 붙어 있는데 드라이버가 안 잡혀 노드 자체가 없는 경우다. 후자는 기다린다고
+# 낫지 않아서 USB 전원 리셋이 필요하다 — 그래서 모터 실패와 따로 본다.
+CAM_FAIL_MARKS = (
     "could not be opened",
     "device busy",
     "Failed to open",
+    "OpenCVCamera",
+    "VIDIOC_",
 )
+
+MOTOR_FAIL_MARKS = MOTOR_FAIL_MARKS + CAM_FAIL_MARKS
 
 
 def _looks_like_motor_failure(lines) -> str:
@@ -469,6 +478,10 @@ def _looks_like_motor_failure(lines) -> str:
             if m in text:
                 return text.strip()[:160]
     return ""
+
+
+def _looks_like_camera_failure(why: str) -> bool:
+    return any(m in why for m in CAM_FAIL_MARKS)
 
 
 def ensure_cams_valid(args, quiet=False):
@@ -482,11 +495,14 @@ def ensure_cams_valid(args, quiet=False):
         return True
     try:
         sys.path.insert(0, str(REPO / "examples" / "lekiwi"))
+        import usb_reset
         from resolve_cameras import links_valid
-        if links_valid():
+        # 링크가 가리키는 노드가 멀쩡해 보여도, USB 쪽에서 드라이버가 빠져 있으면
+        # 열리지 않는다. 링크보다 먼저 본다(리셋하면 어차피 링크를 다시 걸어야 한다).
+        if usb_reset.recover(expect=args.cam_expect, attempts=1, verbose=False) and links_valid():
             return True
         if not quiet:
-            print("  ⚠️ 카메라 링크가 무효해졌습니다(USB 재열거) — 다시 배정합니다")
+            print("  ⚠️ 카메라 상태가 어긋났습니다(USB 재열거/드라이버 빠짐) — 다시 배정합니다")
         return resolve_folding_cams(args)
     except Exception as e:
         if not quiet:
@@ -556,7 +572,16 @@ def run_csi(args):
         if not why:
             print(f"  ✗ 수건개기 실패/중단 (exit {rc}) — 모터 인식 실패가 아니라 재시도하지 않습니다")
             return rc
-        print(f"  ✗ 모터 인식 실패 (exit {rc}): {why}")
+        print(f"  ✗ 인식 실패 (exit {rc}): {why}")
+        if _looks_like_camera_failure(why):
+            # 카메라가 USB 에는 붙어 있는데 드라이버가 안 잡힌 상태는 기다린다고 낫지 않는다.
+            # 뽑았다 꽂는 것과 같은 일(authorized 0→1)을 하고 다시 배정한다.
+            print("  카메라 쪽으로 보입니다 — USB 전원 리셋 후 다시 배정합니다")
+            sys.path.insert(0, str(REPO / "examples" / "lekiwi"))
+            import usb_reset
+            usb_reset.recover(expect=args.cam_expect, attempts=args.cam_resets,
+                              verbose=True, force=True)
+            resolve_folding_cams(args)
         if attempt == args.csi_retries:
             print(f"  ✗ {args.csi_retries}회 모두 실패 — 팔 전원/USB 케이블을 확인하세요")
             return rc
@@ -889,39 +914,63 @@ def home_arms(args):
     return ok
 
 
+def _resolve_cams_once(args):
+    """한 번만 배정해 본다. (성공여부, 사유) 를 돌려준다."""
+    sys.path.insert(0, str(REPO / "examples" / "lekiwi"))
+    from resolve_cameras import (resolve as _resolve_cams,
+                                 wait_released as _wait_released,
+                                 write_links as _write_cam_links)
+    try:
+        mapping, _cams, why = _resolve_cams(verbose=False)
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+    need = ("top", "left_cam", "right_cam")
+    if not all(k in mapping for k in need):
+        return False, ", ".join(w for w in why if "⚠️" in w) or "카메라 부족"
+    _write_cam_links(mapping)
+    # 배정하느라 우리가 4대를 열었다 닫았다. V4L2 는 close 직후 곧바로 재오픈되지 않는
+    # 경우가 있어, 넘겨주기 전에 다시 열리는지 확인한다.
+    # (이걸 빼먹어 롤아웃이 device busy 로 죽는 일이 있었다)
+    _wait_released([mapping[k] for k in need], timeout=15.0, verbose=False)
+    print("  폴딩캠 : " + "  ".join(f"{k}→{os.path.basename(mapping[k])}" for k in need))
+    return True, ""
+
+
 def resolve_folding_cams(args):
     """폴딩 캠 3대를 모델+화면내용으로 배정한다. LeKiwi 단계와 무관하므로
     --skip-task3(폴딩만 실행)에서도 반드시 돌아야 한다.
+
+    udev 이름(/dev/lerobot/camera_N)은 '물리 포트'로 붙는다. 카메라 4대가 2쌍씩 벤더·모델·
+    시리얼이 완전히 같아 udev 단서가 포트뿐이기 때문이다. 자리를 옮기면 이름이 뒤바뀐다
+    (2026-08-05: 폴딩 top 이 세탁기 상공캠을 가리킨 채로 돌았다).
+    그래서 매 실행마다 모델+화면내용으로 다시 배정한다.
+
+    배정에 실패하면 USB 전원 리셋 후 다시 해 본다 — 카메라가 USB 에는 붙어 있는데
+    드라이버가 안 잡혀 /dev/video 노드가 아예 없는 상태가 실제로 생긴다(뽑았다 꽂으면 낫는다).
     """
-    # 폴딩 캠 3대: udev 이름(/dev/lerobot/camera_N)은 '물리 포트'로 붙는다. 카메라 4대가
-    # 2쌍씩 벤더·모델·시리얼이 완전히 같아 udev 단서가 포트뿐이기 때문이다. 자리를 옮기면
-    # 이름이 뒤바뀐다(2026-08-05: 폴딩 top 이 세탁기 상공캠을 가리킨 채로 돌았다).
-    # 매 실행마다 모델+화면내용으로 다시 배정해 ~/.lerobot/cams/ 링크를 갱신한다.
-    if not args.no_cam_resolve:
-        try:
-            sys.path.insert(0, str(REPO / "examples" / "lekiwi"))
-            from resolve_cameras import (resolve as _resolve_cams,
-                                         wait_released as _wait_released,
-                                         write_links as _write_cam_links)
-            mapping, _cams, _why = _resolve_cams(verbose=False)
-            need = ("top", "left_cam", "right_cam")
-            if all(k in mapping for k in need):
-                _write_cam_links(mapping)
-                # 배정하느라 우리가 4대를 열었다 닫았다. V4L2 는 close 직후 곧바로
-                # 재오픈되지 않는 경우가 있어, 넘겨주기 전에 다시 열리는지 확인한다.
-                # (이걸 빼먹어 롤아웃이 device busy 로 죽는 일이 있었다)
-                _wait_released([mapping[k] for k in need], timeout=15.0, verbose=False)
-                print("  폴딩캠 : " + "  ".join(
-                    f"{k}→{os.path.basename(mapping[k])}" for k in need))
+    if args.no_cam_resolve:
+        return True
+    sys.path.insert(0, str(REPO / "examples" / "lekiwi"))
+    import usb_reset
+
+    for i in range(1, args.cam_resets + 2):
+        # 먼저 USB 쪽이 멀쩡한지 본다. 노드가 없으면 배정은 해 볼 것도 없다.
+        # (첫 바퀴는 문제 있을 때만 리셋 — 멀쩡한 걸 흔들면 devnum 만 바뀐다)
+        if not usb_reset.recover(expect=args.cam_expect, attempts=1, verbose=(i > 1)):
+            why = "USB 인식 실패"
+        else:
+            ok, why = _resolve_cams_once(args)
+            if ok:
+                if i > 1:
+                    print(f"           (USB 리셋 {i - 1}회 후 성공)")
                 return True
-            else:
-                print(f"  폴딩캠 : ⚠️ 배정 실패({', '.join(w for w in _why if '⚠️' in w) or '카메라 부족'})"
-                      " — 기존 /dev/lerobot/camera_N 으로 진행")
-                return False
-        except Exception as e:
-            print(f"  폴딩캠 : ⚠️ 자동 배정 건너뜀({type(e).__name__}: {e}) — 기존 경로 사용")
-            return False
-    return True
+        if i > args.cam_resets:
+            break
+        print(f"  폴딩캠 : 배정 실패({why}) — USB 전원 리셋 후 재시도 {i}/{args.cam_resets}")
+        usb_reset.recover(expect=args.cam_expect, attempts=1, verbose=True, force=True)
+
+    print(f"  폴딩캠 : ✗ USB 리셋 {args.cam_resets}회 후에도 실패 — 케이블/허브를 확인하세요")
+    return False
 
 
 # ─────────────────────── [B] 로컬 task3 실행 ───────────────────────
@@ -1030,6 +1079,10 @@ def main():
                     help="6번 순응제어 레지스터(P게인·토크상한) 자동 설정 안 함")
     ap.add_argument("--no-cam-resolve", action="store_true",
                     help="폴딩 캠 자동 배정 안 함(udev 이름을 그대로 씀)")
+    ap.add_argument("--cam-resets", type=int, default=int(os.environ.get("CAM_RESETS", "5")),
+                    help="카메라 인식 실패 시 USB 전원 리셋을 걸 최대 횟수(기본 5). env CAM_RESETS")
+    ap.add_argument("--cam-expect", type=int, default=int(os.environ.get("CAM_EXPECT", "4")),
+                    help="있어야 하는 카메라 대수(폴딩 3 + 세탁기 상공 1 = 4). env CAM_EXPECT")
     ap.add_argument("--no-home", action="store_true",
                     help="카메라 배정 전 양팔 홈 자세 이동을 건너뜀")
     ap.add_argument("--home-seconds", type=float, default=float(os.environ.get("HOME_SECONDS", "3.0")),
