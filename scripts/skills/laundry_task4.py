@@ -69,8 +69,38 @@ REPO = Path(__file__).resolve().parents[2]  # ~/lerobot
 # 원격 실측값(2026-08-04, lerobot-H310M-H): 저장소는 lerobot2/csi-agent/lhwdev 아래,
 # conda 는 miniconda3(랩탑의 miniforge3 와 다름). rollout_auto.py 는 clothing/ 기준 ../train/... 을 본다.
 CSI_HOST = os.environ.get("CSI_HOST", "lerobot@115.145.179.95")  # ~/.ssh/config 별칭 'so101' 도 가능
-CSI_DIR = os.environ.get("CSI_DIR", "/home/lerobot/lerobot2/csi-agent/lhwdev")
-CSI_PYTHON = os.environ.get("CSI_PYTHON", "/home/lerobot/miniconda3/envs/lerobot/bin/python")
+
+
+def _default_csi_dir() -> str:
+    """csi-agent 위치. 예전 본체 경로를 기본값으로 두되, 없으면 실제로 찾아본다.
+    본체나 계정이 바뀌면(lerobot → csi) 박아 둔 경로는 그냥 틀린 경로가 된다."""
+    old = "/home/lerobot/lerobot2/csi-agent/lhwdev"
+    if os.path.isdir(old):
+        return old
+    try:
+        sys.path.insert(0, str(REPO / "examples" / "lekiwi"))
+        from csi_paths import work_dir
+        return str(work_dir())
+    except Exception:
+        return old  # 못 찾으면 예전 값 그대로 — preflight 가 '없음'으로 잡아 준다
+
+
+def _default_csi_python() -> str:
+    """폴딩을 돌릴 파이썬. 본체마다 conda 위치가 다르다(miniconda3 / miniforge3)."""
+    old = "/home/lerobot/miniconda3/envs/lerobot/bin/python"
+    if os.path.exists(old):
+        return old
+    home = os.path.expanduser("~")
+    for c in (f"{home}/miniconda3/envs/lerobot/bin/python",
+              f"{home}/miniforge3/envs/lerobot/bin/python",
+              f"{home}/anaconda3/envs/lerobot/bin/python"):
+        if os.path.exists(c):
+            return c
+    return sys.executable  # 최후: 지금 이 스크립트를 돌리는 파이썬
+
+
+CSI_DIR = os.environ.get("CSI_DIR") or _default_csi_dir()
+CSI_PYTHON = os.environ.get("CSI_PYTHON") or _default_csi_python()
 # 기본은 --no_step0 = step0(펼치기)를 빼고 step1(접기)부터. step0 정책이 아직 불완전해서다.
 # 이러면 classifier 의 IDLE 탈출 후보가 class 2~3 으로 좁혀져서(rollout.py: start_step = 2),
 # '수건이 펴져 있다'고 인식될 때까지 IDLE 에서 기다렸다가 접기부터 시작한다.
@@ -850,7 +880,8 @@ def check_models(args) -> bool:
             print(f"           {label:<10} OK  ({tgt}, {size / 1e6:.0f}MB)")
     if not ok:
         print("           소유자가 다른 계정이라 못 고치는 경우 본체에서:")
-        print("             sudo chmod -R a+rX /home/lerobot/lerobot2/csi-agent/lhwdev/train")
+        print(f"             sudo chmod -R a+rX "
+              f"{Path(os.path.expanduser(args.csi_dir)) / 'train'}")
     return ok
 
 
@@ -1032,10 +1063,17 @@ def run_task3(args, passthrough):
         env["REMOTE_IP"] = args.jetson_ip            # 지정 시 task3 의 유/무선 기본값보다 우선
     if args.handoff_motion:
         env["HANDOFF_MOTION"] = args.handoff_motion  # 마지막 후퇴 뒤 전달 모션
-    cmd = [local_python(), str(args.task3), *passthrough]
+    extra = []
+    if args.rulebased:
+        # VLA 대신 녹화 모션 재생 + probe 판정. task3 는 이 경우 SmolVLA 를 아예 안 읽는다.
+        extra = ["--rulebased", "--grab-motion", args.grab_motion,
+                 "--grab-attempts", str(args.grab_attempts)]
+        print(f"  집기 방식: 규칙기반 (모션 '{args.grab_motion}', 재시도 {args.grab_attempts}회) — VLA 미사용")
+    cmd = [local_python(), str(args.task3), *extra, *passthrough]
     rc = run_streaming(cmd, "  | ", cwd=str(REPO), env=env)
     codes = {0: "성공", 3: "approach 실패", 4: "문열기 실패", 5: "사용자 abort",
-             6: "throw 모션 실패", 7: "전달 모션 실패", 8: "상공 카메라 못 찾음", 130: "Ctrl+C 중단"}
+             6: "throw 모션 실패", 7: "전달 모션 실패", 8: "상공 카메라 못 찾음",
+             9: "집기 모션 파일 없음", 10: "집기 실패(헛집음)", 130: "Ctrl+C 중단"}
     print(f"  → task3 exit {rc} ({codes.get(rc, '알 수 없는 실패')})")
     return rc
 
@@ -1079,6 +1117,13 @@ def main():
                     help="6번 순응제어 레지스터(P게인·토크상한) 자동 설정 안 함")
     ap.add_argument("--no-cam-resolve", action="store_true",
                     help="폴딩 캠 자동 배정 안 함(udev 이름을 그대로 씀)")
+    ap.add_argument("--rulebased", action="store_true",
+                    help="LeKiwi 집기를 VLA 대신 규칙기반으로(laundry_task2 방식: 녹화 모션 재생 + probe 판정 + 재시도). "
+                         "SmolVLA 를 아예 로드하지 않아 GPU·체크포인트 문제를 통째로 피한다")
+    ap.add_argument("--grab-motion", default=os.environ.get("GRAB_MOTION", "laundry_grab"),
+                    help="규칙기반 집기 모션(motions/<이름>.json, 기본 laundry_grab). env GRAB_MOTION")
+    ap.add_argument("--grab-attempts", type=int, default=int(os.environ.get("GRAB_ATTEMPTS", "3")),
+                    help="규칙기반 집기 재시도 횟수(기본 3). env GRAB_ATTEMPTS")
     ap.add_argument("--cam-resets", type=int, default=int(os.environ.get("CAM_RESETS", "5")),
                     help="카메라 인식 실패 시 USB 전원 리셋을 걸 최대 횟수(기본 5). env CAM_RESETS")
     ap.add_argument("--cam-expect", type=int, default=int(os.environ.get("CAM_EXPECT", "4")),

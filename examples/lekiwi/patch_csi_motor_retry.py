@@ -15,7 +15,11 @@
 import pathlib
 import sys
 
-TARGET = pathlib.Path("/home/lerobot/lerobot2/csi-agent/lhwdev/clothing/rollout.py")
+import sys as _sys
+_sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from csi_paths import clothing  # noqa: E402  경로는 csi_paths 한 곳에서 정한다
+
+TARGET = clothing() / "rollout.py"
 BACKUP = TARGET.with_suffix(".py.bak.motorretry")
 
 # 참고: setup_devices.py:76 의 robot.connect() 는 여기서 감싸지 않는다.

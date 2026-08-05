@@ -78,6 +78,20 @@ WRIST_THRESHOLD = float(os.environ.get("WRIST_THRESHOLD", "0.5"))
 GRIP_SQUEEZE = float(os.environ.get("GRIP_SQUEEZE", "0"))
 GRIP_SQUEEZE_SEC = float(os.environ.get("GRIP_SQUEEZE_SEC", "1.2"))
 
+# ── 규칙기반 집기(VLA 대체) — laundry_task2 / laundry/grab_place.py 의 방식 ──
+# VLA 는 GPU·체크포인트·관측 파이프라인이 전부 맞아야 돌아간다. 하나라도 어긋나면
+# [3]에서 통째로 멈추는데, 시연에서는 그 앞(접근·문열기)이 이미 끝난 뒤라 손해가 크다.
+# task2 가 쓰던 방식 — '녹화해 둔 집기 모션을 그대로 재생하고 probe 로 잡혔는지 판정,
+# 실패하면 다시' — 을 대안으로 둔다. 판정에 쓰는 게이트는 VLA 판과 완전히 같은 것이라
+# '잡았다'의 기준이 달라지지 않는다.
+# 모션 재생은 이미 있는 replay_motion(ZMQ) 을 그대로 쓴다. task2 는 Jetson 에서 시리얼
+# 버스를 직접 잡았지만(REPO=/home/comnet02/lerobot), 지금 구조는 host 가 그 버스를
+# 쥐고 있어서 그대로는 못 돌린다 — 그래서 '방식'만 옮겨 왔다.
+RULEBASED = os.environ.get("RULEBASED", "0") not in ("0", "false", "")
+GRAB_MOTION = os.environ.get("GRAB_MOTION", "laundry_grab")
+GRAB_ATTEMPTS = int(os.environ.get("GRAB_ATTEMPTS", "3"))
+GRAB_SETTLE_SEC = float(os.environ.get("GRAB_SETTLE_SEC", "0.8"))  # 재생 후 판정 전 정지 대기
+
 # ── 순응 물기(compliant grip) — laundry_task2/grab_place.py 의 2단계 물기를 ZMQ 로 옮긴 것 ──
 # 왜 필요한가: OPENCATCH 자세로 그리퍼를 닫아 두기만 하면, 손잡이에 막혀 '도달 못 하는 목표'를
 #   계속 밀게 된다. STS3215 는 부하가 Overload_Torque 를 Protection_Time 넘게 지속하면 출력을
@@ -370,6 +384,82 @@ def replay_motion(robot, name, rec=None, ohcap=None):
             rec.add(robot.get_observation(), oh)
         time.sleep(interval)
     return True
+
+
+def motion_first_action(name):
+    """motions/<name>.json 의 첫 프레임을 포즈와 같은 형식의 액션으로 돌려준다.
+    모션 재생 전에 그 자세로 '천천히' 먼저 가려고 쓴다. 없으면 None."""
+    path = REPO / "motions" / f"{name}.json"
+    if not path.exists():
+        return None
+    frames = json.load(open(path)).get("frames", [])
+    if not frames:
+        return None
+    act = {f"arm_{j}.pos": raw_to_norm(j, frames[0][j]) for j in ARM_JOINTS if j in frames[0]}
+    act.update({k: 0.0 for k in BASE_KEYS})
+    return act
+
+
+def rulebased_grab(robot, poses, overhead_gate, wrist_gate, read_oh,
+                   motion=None, attempts=None, rec=None, ohcap=None):
+    """VLA 없이 집는다: 집기자세 → 모션 재생 → probe 판정 → 실패하면 다시.
+
+    반환: 성공하면 판정에 쓴 observation(그 뒤 압착·carry 단계가 이걸 쓴다), 실패하면 None.
+
+    VLA 판과 다른 점은 '어떻게 움직이나' 하나뿐이다. 판정 게이트도, 그 뒤 단계도 같다.
+    상공캠으로 먼저 보고 손목캠으로 확정하는 순서도 그대로다 — 상공은 '수건이 들렸나',
+    손목은 '실제로 물렸나'를 보기 때문에 둘 다 봐야 헛집음을 거른다.
+    """
+    motion = motion or GRAB_MOTION
+    attempts = attempts or GRAB_ATTEMPTS
+    start = motion_first_action(motion)
+    if start is None:
+        print(f"[3] ✗ 모션 '{motion}' 을 못 읽었습니다 — 재시도해도 같습니다")
+        return None
+    for attempt in range(1, attempts + 1):
+        print(f"[3] 규칙기반 집기 시도 {attempt}/{attempts}: "
+              f"'{READY_POSE}' → 모션 '{motion}' 시작자세 → 재생")
+        move_to_pose(poses[READY_POSE], robot=robot, duration=HOME_DURATION, fps=FPS)
+        # 모션의 '첫 프레임'으로 먼저 부드럽게 간다. replay_motion 은 프레임을 interval
+        # (0.3초)마다 그대로 던지므로, 시작 자세가 지금 자세와 멀면 첫 프레임에서 팔이
+        # 그 거리를 0.3초 만에 가려고 튄다. 실측: laundry_grab 의 첫 프레임은
+        # laundry_grabready 와 shoulder_lift 가 1205 스텝(≈106°) 떨어져 있다.
+        move_to_pose(start, robot=robot, duration=HOME_DURATION, fps=FPS)
+        if not replay_motion(robot, motion, rec=rec, ohcap=ohcap):
+            print(f"[3] ✗ 모션 '{motion}' 재생 실패")
+            return None
+        # 재생 직후엔 팔이 아직 흔들린다. 흔들리는 프레임으로 판정하면 신뢰도가 튄다.
+        time.sleep(GRAB_SETTLE_SEC)
+
+        obs = robot.get_observation()
+        oh = read_oh()
+        overhead_gate.reset()
+        oh_ok, oh_p = False, 0.0
+        if oh is not None:
+            # GraspGate 는 GRASP_HOLD 프레임 연속으로 넘어야 인정한다(순간 튐 방지).
+            # 여기서는 정지 상태라 같은 장면을 그만큼 넣어 준다.
+            for _ in range(max(1, GRASP_HOLD)):
+                oh_ok, oh_p, _ = overhead_gate.update(cv2.cvtColor(oh, cv2.COLOR_BGR2RGB))
+        else:
+            print("[3]   ⚠️ 상공 프레임 없음 — 손목캠만으로 판정합니다")
+
+        wf = obs.get("wrist")
+        wr_ok, wr_p = False, 0.0
+        if isinstance(wf, np.ndarray):
+            wtop, _, wsc = wrist_gate.predict(wf)
+            wr_p = wsc.get("grabbed", 0.0)
+            wr_ok = (wtop == "grabbed" and wr_p >= WRIST_THRESHOLD)
+
+        print(f"[3]   상공 {'✅' if oh_ok else '✗'}(p={oh_p:.2f})  "
+              f"손목 {'✅' if wr_ok else '✗'}(p={wr_p:.2f})")
+        # 상공 프레임이 없을 때만 손목 단독 판정을 허용한다. 둘 다 볼 수 있으면 둘 다 맞아야 한다.
+        if (oh_ok and wr_ok) or (oh is None and wr_ok):
+            print(f"[3] ✅ 잡음 ({attempt}번째 시도)")
+            return obs
+        if attempt < attempts:
+            print("[3]   헛집음 — 다시 시도합니다")
+    print(f"[3] ✗ {attempts}회 모두 헛집음")
+    return None
 
 
 # ─────────────────────── approach(빨간블롭) ───────────────────────
@@ -673,6 +763,13 @@ def main():
     ap.add_argument("--record-dir", default=None)
     ap.add_argument("--skip-approach", action="store_true", help="이미 세탁기 앞이면 접근 생략")
     ap.add_argument("--skip-door", action="store_true", help="문 열려있으면 문열기 생략")
+    ap.add_argument("--rulebased", action="store_true",
+                    help="VLA 대신 규칙기반으로 집는다(laundry_task2 방식: 녹화 모션 재생 + probe 판정 + 재시도). "
+                         "SmolVLA 를 아예 로드하지 않는다. env RULEBASED=1")
+    ap.add_argument("--grab-motion", default=GRAB_MOTION,
+                    help=f"규칙기반 집기 모션(motions/<이름>.json, 기본 {GRAB_MOTION}). env GRAB_MOTION")
+    ap.add_argument("--grab-attempts", type=int, default=GRAB_ATTEMPTS,
+                    help=f"규칙기반 집기 재시도 횟수(기본 {GRAB_ATTEMPTS}). env GRAB_ATTEMPTS")
     ap.add_argument("--yes", action="store_true")
     args = ap.parse_args()
 
@@ -685,12 +782,20 @@ def main():
           f"approach={'skip' if args.skip_approach else 'on'}  door={'skip' if args.skip_door else 'on'}")
     print("[preload] host 확인/기동 (Jetson lekiwi_host)...")
     ensure_host(remote_ip)  # host 를 먼저 띄우고, 부팅되는 동안 아래 모델을 로드
-    print("[preload] SmolVLA...")
-    policy = SmolVLAPolicy.from_pretrained(args.checkpoint); policy.eval()
-    device = torch.device(policy.config.device)
-    preprocessor, postprocessor = make_pre_post_processors(
-        policy_cfg=policy.config, pretrained_path=args.checkpoint,
-        preprocessor_overrides={"device_processor": {"device": str(device)}})
+    rulebased = args.rulebased or RULEBASED
+    policy = preprocessor = postprocessor = None
+    if rulebased:
+        # VLA 를 아예 안 읽는다 — '작동하지 않을 때의 대비'인데 여기서 죽으면 의미가 없다.
+        # probe 는 판정에 계속 쓰므로 GPU 가 있으면 그대로 쓴다.
+        print("[preload] 규칙기반 집기 — SmolVLA 로딩 건너뜀")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        print("[preload] SmolVLA...")
+        policy = SmolVLAPolicy.from_pretrained(args.checkpoint); policy.eval()
+        device = torch.device(policy.config.device)
+        preprocessor, postprocessor = make_pre_post_processors(
+            policy_cfg=policy.config, pretrained_path=args.checkpoint,
+            preprocessor_overrides={"device_processor": {"device": str(device)}})
     robot = LeKiwiClient(LeKiwiClientConfig(remote_ip=remote_ip, id="lekiwi", connect_timeout_s=15))
     renamed = {RENAME.get(k, k): v for k, v in dict(robot.observation_features).items()}
     ds_features = {**hw_to_dataset_features(renamed, OBS_STR),
@@ -715,11 +820,20 @@ def main():
     _ = load_pose(NOTHING_POSE)  # shoulder_pan 참조
     cal = load_red_params()
     # throw/openseasame 존재 확인
-    for m in ("laundry_throw", "openseasame"):
+    needed_motions = ["laundry_throw", "openseasame"]
+    if rulebased:
+        needed_motions.append(args.grab_motion)  # 없으면 [3]에서야 알게 되므로 여기서 걸러 준다
+    for m in needed_motions:
         if not (REPO / "motions" / f"{m}.json").exists():
             print(f"  ⚠️ 모션 없음: {m}")
+            if rulebased and m == args.grab_motion:
+                print(f"[preload] ✗ 규칙기반 집기에 필요한 모션이 없습니다: "
+                      f"{REPO / 'motions' / f'{m}.json'}")
+                return 9
 
-    robot.connect(); policy.reset()
+    robot.connect()
+    if policy is not None:
+        policy.reset()
     win = "laundry_task3  [Q/ESC] abort"
     gui = True
     try:
@@ -759,32 +873,41 @@ def main():
             if not open_door(robot, poses, rec=rec, ohcap=ohcap):
                 print("문열기 실패 → 종료"); return 4
 
-        # [3] grab: grabready → VLA(상공 게이트 자동 정지)
-        print(f"[3] grab: '{READY_POSE}' 복귀 후 VLA 집기")
-        move_to_pose(poses[READY_POSE], robot=robot, duration=HOME_DURATION, fps=FPS)
-        policy.reset(); overhead_gate.reset()
-        stop_obs = None; frame_i = 0
-        while True:
-            t0 = time.perf_counter()
-            obs = robot.get_observation(); oh = read_oh()
-            obs_frame = build_dataset_frame(ds_features, {RENAME.get(k, k): v for k, v in obs.items()}, prefix=OBS_STR)
-            at = predict_action(observation=obs_frame, policy=policy, device=device,
-                                preprocessor=preprocessor, postprocessor=postprocessor,
-                                use_amp=device.type == "cuda", task=TASK_DESCRIPTION, robot_type=robot.name)
-            action = make_robot_action(at, ds_features)
-            for k in BASE_KEYS:
-                action[k] = 0.0
-            robot.send_action(action)
-            frame_i += 1
-            if rec is not None and frame_i % RECORD_STRIDE == 0:
-                rec.add(obs, oh)
-            if oh is not None and frame_i % GRASP_CHECK_EVERY == 0:
-                grabbed, prob, _ = overhead_gate.update(cv2.cvtColor(oh, cv2.COLOR_BGR2RGB))
-                if grabbed:
-                    print(f"[3] ▶ 상공 GRABBED (p={prob:.2f}) → VLA 정지"); stop_obs = obs; break
-            if gui and show(win, obs, oh, "grab: VLA running") in (ord("q"), 27):
-                print("[중단]"); return 5
-            time.sleep(max(1.0 / FPS - (time.perf_counter() - t0), 0.0))
+        # [3] grab — 규칙기반이면 모션 재생, 아니면 VLA
+        if rulebased:
+            stop_obs = rulebased_grab(robot, poses, overhead_gate, wrist_gate, read_oh,
+                                      motion=args.grab_motion, attempts=args.grab_attempts,
+                                      rec=rec, ohcap=ohcap)
+            if stop_obs is None:
+                # 6 은 throw 모션 실패가 이미 쓰고 있다. laundry_task4 가 종료코드로
+                # 원인을 구분하므로 겹치면 엉뚱한 진단이 뜬다.
+                print("집기 실패 → 종료"); return 10
+        else:
+            print(f"[3] grab: '{READY_POSE}' 복귀 후 VLA 집기")
+            move_to_pose(poses[READY_POSE], robot=robot, duration=HOME_DURATION, fps=FPS)
+            policy.reset(); overhead_gate.reset()
+            stop_obs = None; frame_i = 0
+            while True:
+                t0 = time.perf_counter()
+                obs = robot.get_observation(); oh = read_oh()
+                obs_frame = build_dataset_frame(ds_features, {RENAME.get(k, k): v for k, v in obs.items()}, prefix=OBS_STR)
+                at = predict_action(observation=obs_frame, policy=policy, device=device,
+                                    preprocessor=preprocessor, postprocessor=postprocessor,
+                                    use_amp=device.type == "cuda", task=TASK_DESCRIPTION, robot_type=robot.name)
+                action = make_robot_action(at, ds_features)
+                for k in BASE_KEYS:
+                    action[k] = 0.0
+                robot.send_action(action)
+                frame_i += 1
+                if rec is not None and frame_i % RECORD_STRIDE == 0:
+                    rec.add(obs, oh)
+                if oh is not None and frame_i % GRASP_CHECK_EVERY == 0:
+                    grabbed, prob, _ = overhead_gate.update(cv2.cvtColor(oh, cv2.COLOR_BGR2RGB))
+                    if grabbed:
+                        print(f"[3] ▶ 상공 GRABBED (p={prob:.2f}) → VLA 정지"); stop_obs = obs; break
+                if gui and show(win, obs, oh, "grab: VLA running") in (ord("q"), 27):
+                    print("[중단]"); return 5
+                time.sleep(max(1.0 / FPS - (time.perf_counter() - t0), 0.0))
 
         # [4] 손목 확정 + [5] 압착
         confirmed = True

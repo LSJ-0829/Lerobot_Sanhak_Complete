@@ -16,8 +16,12 @@ import sys
 import time
 from pathlib import Path
 
-CLOTHING = Path("/home/lerobot/lerobot2/csi-agent/lhwdev/clothing")
-OUT = CLOTHING / "idle_posture.json"
+def out_path() -> Path:
+    """저장 위치. 모듈을 읽는 시점이 아니라 쓸 때 정한다 —
+    laundry_task4 가 mk_arms/connect_with_retry 만 쓰려고 이 파일을 import 하는데,
+    그때 csi-agent 를 못 찾는다고 import 자체가 실패하면 곤란하다."""
+    from csi_paths import clothing  # 경로는 csi_paths 한 곳에서 정한다
+    return clothing() / "idle_posture.json"
 
 
 def _hard_disconnect(robot):
@@ -110,12 +114,13 @@ def main():
         print(f"\n✗ 12축이 아니라 {len(joints)}축이다 — 팔 연결을 확인하고 다시 시도할 것")
         return 1
 
-    if OUT.exists():
-        bak = OUT.with_suffix(".json.bak")
-        bak.write_text(OUT.read_text())
+    out = out_path()
+    if out.exists():
+        bak = out.with_suffix(".json.bak")
+        bak.write_text(out.read_text())
         print(f"\n기존 파일 백업: {bak.name}")
-    OUT.write_text(json.dumps({"joint_positions": joints}, indent=2))
-    print(f"저장됨: {OUT}")
+    out.write_text(json.dumps({"joint_positions": joints}, indent=2))
+    print(f"저장됨: {out}")
     print("이제 rollout 의 RobotHoming 이 이 자세로 복귀한다.")
     return 0
 
