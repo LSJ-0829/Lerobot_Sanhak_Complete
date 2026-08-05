@@ -106,11 +106,16 @@ GRIP_EXTRA_SEC = float(os.environ.get("GRIP_EXTRA_SEC", "0.5"))   # 물린 뒤 �
 #   raw = wheel_linear(m/s) × 13038
 #   전진  raw500 → 500/(0.866×13038) = 0.044 m/s   (open_door2/grab_place drive_speed=500)
 #   strafe raw400 → 400/(1.000×13038) = 0.031 m/s   (open_door2 strafe_speed=400)
-#   회전  raw300 → 300/(0.125×13038) = 0.184 rad/s
-# 검산: 0.184 rad/s × 16.9s = 178도 — Lerobot_Sanhak/laundry_task3 의 "16.9초(speed 300 실측)"와 일치.
+#   회전  raw300 → 300/(0.125×13038) = 0.184 rad/s = 10.55 deg/s
+#
+# ⚠️ theta.vel 의 단위는 rad/s 가 아니라 **deg/s** 다. host 의 _body_to_wheel_raw() 가
+#    받자마자 theta * (pi/180) 으로 rad/s 로 바꾼다(docstring: "theta_cmd: Rotational
+#    velocity (deg/s)"). 2026-08-05 에 여기 rad/s 값(0.184)을 그대로 넣어 두는 바람에
+#    57배 느려져, 180도 회전이 3도밖에 안 됐다. 전후/좌우(x,y)는 m/s 가 맞다.
+# 검산: 10.55 deg/s × 16.9s = 178도 — Lerobot_Sanhak/laundry_task3 의 "16.9초(speed 300 실측)"와 일치.
 V_FWD = float(os.environ.get("V_FWD", "0.044"))       # 전후진 속도 m/s
 V_STRAFE = float(os.environ.get("V_STRAFE", "0.031"))  # 좌우 strafe 속도 m/s
-V_ROT = float(os.environ.get("V_ROT", "0.184"))        # 회전 속도 rad/s
+V_ROT = float(os.environ.get("V_ROT", "10.55"))        # 회전 속도 deg/s (rad/s 아님!)
 # 실기 확인(2026-08-04): 좌우가 반대로 나가서 뒤집었다.
 Y_RIGHT = float(os.environ.get("Y_RIGHT", "-1"))      # y.vel 부호: +값이 '오른쪽'이면 1
 THETA_CW = float(os.environ.get("THETA_CW", "-1"))    # theta.vel 부호: 시계(우)회전이 음수면 -1
