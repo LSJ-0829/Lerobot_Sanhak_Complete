@@ -94,6 +94,27 @@ sudo systemctl daemon-reload && sudo systemctl enable --now lekiwi-usbnet.servic
 ping -c1 192.168.55.1
 ```
 
+### 참고: USB를 뺐다가 꽂았을 시
+
+> 이현우가 추가했습니다
+
+Jetson 재부팅/USB 재연결 시 USB 네트워크 인터페이스가 재생성돼서 임시 IP설정이 초기화됩니다. 따라서
+`lekiwi-usbnet.service`를 재시작해야 합니다.
+
+```
+sudo systemctl restart lekiwi-usbnet.service
+```
+
+#### 참고용 잼민이의 말
+
+원인 분석 (Root Cause Analysis)
+Jetson 장치가 USB 로 정상 인식되어 있으나, Jetson USB 이더넷 인터페이스에 정적 IP (192.168.55.100/24)가 할당되어 있지 않아 Ping 및 SSH 접속이 불가능한 상태입니다.
+
+상세 원인:
+lekiwi-usbnet.service가 부팅 시점에 1회 실행되어 enxba5425a49afc 인터페이스에 IP를 할당했습니다.
+이후 Jetson 재부팅/USB 재연결로 인해 USB 네트워크 인터페이스(enxba5425a49afc, enxba5425a49afe)가 재생성되면서 임시 IP 설정이 초기화되었습니다.
+기존 lekiwi-usbnet.service는 Type=oneshot 및 RemainAfterExit=yes로 설정되어 있어, USB 재연결 시 systemd가 스크립트를 재실행하지 않고 active (exited) 상태를 유지했기 때문에 IP가 누락되었습니다.
+
 ### ⚠️ DHCP(`nmcli device connect`)를 쓰면 안 된다
 
 Jetson 이 DHCP 로 **default route 까지 내려주고**, NetworkManager 가 그걸 설치하면서
