@@ -78,6 +78,25 @@ WRIST_THRESHOLD = float(os.environ.get("WRIST_THRESHOLD", "0.5"))
 GRIP_SQUEEZE = float(os.environ.get("GRIP_SQUEEZE", "0"))
 GRIP_SQUEEZE_SEC = float(os.environ.get("GRIP_SQUEEZE_SEC", "1.2"))
 
+# ── 순응 물기(compliant grip) — laundry_task2/grab_place.py 의 2단계 물기를 ZMQ 로 옮긴 것 ──
+# 왜 필요한가: OPENCATCH 자세로 그리퍼를 닫아 두기만 하면, 손잡이에 막혀 '도달 못 하는 목표'를
+#   계속 밀게 된다. STS3215 는 부하가 Overload_Torque 를 Protection_Time 넘게 지속하면 출력을
+#   Protective_Torque(기본 20%)로 낮춘다 → 물던 힘이 스스로 빠지면서 손잡이를 놓친다.
+# 2단계로 나눠 그걸 피한다(원본과 동일한 원리):
+#   1단계(압착) 완전히 닫힘 쪽으로 밀며 실제 위치를 폴링. 더 이상 안 닫히면(=물었다) 중단.
+#   2단계(유지) '지금 도달한 위치'를 목표로 다시 써서 위치오차≈0 → 지속 토크가 뚝 떨어진다.
+#              문 힘은 그대로 유지되고 과부하 래치가 안 걸린다.
+# ZMQ 로는 Torque_Limit/P_Coefficient 같은 레지스터를 못 건드리므로 위치 제어만으로 구현한다.
+# 레지스터 튜닝(P게인·과부하 완화)은 Jetson 에서 별도로 해야 효과가 더 커진다.
+COMPLIANT_GRIP = os.environ.get("COMPLIANT_GRIP", "1") not in ("0", "false", "")
+# 그리퍼 정규화 .pos 는 0=완전닫힘(raw 2005) ~ 100=열림(raw 3176). opencatch 자세는 raw 2069=5.5.
+# 압착 목표는 0(완전닫힘) — 손잡이에 막혀 도달하지 못하는 게 정상이고, 그 막힘을 감지해 유지로 넘어간다.
+GRIP_CLOSE_POS = float(os.environ.get("GRIP_CLOSE_POS", "0"))
+GRIP_SQUEEZE_MAX_SEC = float(os.environ.get("GRIP_SQUEEZE_MAX_SEC", "6.0"))  # 발열 안전 상한
+GRIP_STALL_PX = float(os.environ.get("GRIP_STALL_PX", "0.4"))     # 이보다 덜 움직이면 '막혔다'
+GRIP_STALL_SEC = float(os.environ.get("GRIP_STALL_SEC", "0.5"))   # 그 상태가 이만큼 지속되면 물린 것
+GRIP_EXTRA_SEC = float(os.environ.get("GRIP_EXTRA_SEC", "0.5"))   # 물린 뒤 추가 압착
+
 # ══════════════════ ⚠️ CALIBRATION (실기 재보정) ══════════════════
 # ZMQ base 속도는 m/s(x,y)·rad/s(theta) 물리단위라 기존 직접버스 wheel-speed/시간과 다르다.
 # 부호(Y_RIGHT/THETA_CW)는 실기에서 방향 확인 후 뒤집는다.
@@ -207,6 +226,77 @@ def _p_vel(err_px, v_max, axis_sign):
     frac = min(1.0, abs(err_px) / max(1.0, APPROACH_FULL_PX))
     v = max(V_APPROACH_MIN, v_max * frac)
     return -axis_sign * (1 if err_px > 0 else -1) * v
+
+
+def compliant_grip(robot, close_pos=None, rec=None, ohcap=None):
+    """2단계 순응 물기. 물린 위치를 반환(실패 시 None).
+
+    grab_place.py 의 compliant_grip 과 같은 원리지만, ZMQ 는 Torque_Limit 을 못 쓰므로
+    '도달 못 하는 목표를 계속 밀지 않는다'는 2단계의 핵심만 위치 제어로 구현한다.
+    """
+    if not COMPLIANT_GRIP:
+        return None
+    close_pos = GRIP_CLOSE_POS if close_pos is None else close_pos
+
+    obs = robot.get_observation()
+    arm = {k: float(v) for k, v in obs.items()
+           if isinstance(v, (int, float)) and k.startswith("arm_") and k.endswith(".pos")}
+    if "arm_gripper.pos" not in arm:
+        print("[grip] ⚠️ arm_gripper.pos 를 못 읽어 순응 물기 생략")
+        return None
+    start = arm["arm_gripper.pos"]
+    print(f"[grip] 순응 물기 1단계(압착): {start:.1f} → {close_pos:.1f} "
+          f"(최대 {GRIP_SQUEEZE_MAX_SEC}s, {GRIP_STALL_PX} 미만 이동이 {GRIP_STALL_SEC}s 지속되면 물린 것)")
+
+    deadline = time.time() + GRIP_SQUEEZE_MAX_SEC
+    last_pos, stall_since = start, None
+    gripped_at = None
+    while time.time() < deadline:
+        g = dict(arm)
+        g["arm_gripper.pos"] = close_pos
+        g.update({"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0})
+        robot.send_action(g)
+        time.sleep(1.0 / FPS)
+
+        obs = robot.get_observation()
+        pos = float(obs.get("arm_gripper.pos", last_pos))
+        if rec is not None:
+            rec.add(obs, (ohcap.read()[1] if ohcap else None))
+        # 손잡이에 막혀 더 안 닫히면 = 물었다. 여기서 멈춰야 과부하 래치를 피한다.
+        if abs(pos - last_pos) < GRIP_STALL_PX:
+            stall_since = stall_since or time.time()
+            if time.time() - stall_since >= GRIP_STALL_SEC:
+                gripped_at = pos
+                break
+        else:
+            stall_since = None
+        last_pos = pos
+        arm["arm_gripper.pos"] = pos      # 나머지 관절은 시작 자세 유지
+
+    if gripped_at is None:
+        gripped_at = last_pos
+        print(f"[grip]   ⚠️ {GRIP_SQUEEZE_MAX_SEC}s 안에 멈추지 않음 — 현재 위치 {gripped_at:.1f} 로 유지 전환")
+    else:
+        print(f"[grip]   물림 감지: {gripped_at:.1f} (시작 {start:.1f} 에서 {start - gripped_at:+.1f})")
+
+    # 추가 압착 — 두꺼운 손잡이/천이 조금 더 파고들도록.
+    if GRIP_EXTRA_SEC > 0:
+        for _ in range(max(1, int(GRIP_EXTRA_SEC * FPS))):
+            g = dict(arm); g["arm_gripper.pos"] = close_pos
+            g.update({"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0})
+            robot.send_action(g)
+            time.sleep(1.0 / FPS)
+        gripped_at = float(robot.get_observation().get("arm_gripper.pos", gripped_at))
+
+    # 2단계(유지): 도달한 위치를 그대로 목표로 → 위치오차≈0 → 지속 토크 급감, 문 힘은 유지.
+    print(f"[grip] 순응 물기 2단계(유지): 목표를 현재 위치 {gripped_at:.1f} 로 고정 "
+          "(위치오차≈0 → 과부하 래치 회피)")
+    for _ in range(max(1, int(0.3 * FPS))):
+        g = dict(arm); g["arm_gripper.pos"] = gripped_at
+        g.update({"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0})
+        robot.send_action(g)
+        time.sleep(1.0 / FPS)
+    return gripped_at
 
 
 def replay_motion(robot, name, rec=None, ohcap=None):
@@ -382,6 +472,10 @@ def open_door(robot, poses, rec=None, ohcap=None):
 
     print(f"[door] 손잡이 무는 자세 '{OPENCATCH}'")
     move_to_pose(poses[OPENCATCH], robot=robot, duration=HOME_DURATION, fps=FPS, hold_gripper=False)
+
+    # 자세만으로 닫아 두면 손잡이에 막힌 목표를 계속 밀다 과부하 보호가 걸려 힘이 빠진다
+    # (= 뒤로 당길 때 손잡이를 놓치는 원인). 2단계 순응 물기로 바꿔 문 힘을 유지한다.
+    compliant_grip(robot, rec=rec, ohcap=ohcap)
 
     # 후진 + shoulder_pan(1번)만 nothing 값까지 회전(나머지 opencatch 유지)
     target_pan = load_pose(NOTHING_POSE)["shoulder_pan"]

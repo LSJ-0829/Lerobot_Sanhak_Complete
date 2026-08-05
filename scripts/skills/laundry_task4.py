@@ -100,12 +100,33 @@ HOST_PORTS = (5555, 5556)
 KEEPALIVE_PATH = "~/lekiwi_host_keepalive.sh"
 KEEPALIVE_SH = r"""#!/bin/bash
 # lekiwi_host 자동 재기동 래퍼 (laundry_task4.py 가 생성/관리).
+#
+# ⚠️ host 는 반드시 '한 번에 하나'만 떠야 한다.
+#    두 개가 뜨면 뒤에 뜬 쪽은 5555 바인드에 실패하고도 루프를 계속 돌면서,
+#    명령을 한 번도 못 받으니 워치독이 0.5초마다 stop_base() 를 같은 모터 버스에
+#    써 넣는다 → 앞의 host 가 굴리던 바퀴가 0.5초 주기로 끊긴다.
+#    flock 으로 상호배제한다. 중복 실행은 조용히 종료된다(경합 없음).
+LOCK="$HOME/.lekiwi_host.lock"
+exec 9>"$LOCK" || exit 1
+if ! flock -n 9; then
+  echo "[keepalive] $(date +%F' '%T) 이미 실행 중 — 중복 기동 취소" >> "$HOME/lekiwi_host.log"
+  exit 0
+fi
+
+# 여기 왔다는 건 다른 keepalive 가 없다는 뜻 → 살아있는 host 는 죽은 래퍼가 남긴 고아다.
+if pkill -f 'lerobot\.robots\.lekiwi\.lekiwi_host' 2>/dev/null; then
+  echo "[keepalive] $(date +%F' '%T) 고아 host 정리함" >> "$HOME/lekiwi_host.log"
+  sleep 2
+fi
+
 cd "$HOME/lerobot" || exit 1
 PY="$HOME/miniforge3/envs/lerobot/bin/python"
 while true; do
   echo "[keepalive] $(date +%F' '%T) host 기동" >> "$HOME/lekiwi_host.log"
+  # 9>&- : 잠금 fd 를 자식에게 물려주지 않는다. 안 그러면 래퍼가 죽고 host 만 남았을 때
+  #        그 고아가 잠금을 계속 쥐고 있어 새 래퍼가 영영 못 뜬다.
   "$PY" -m lerobot.robots.lekiwi.lekiwi_host \
-      --robot.id=my_awesome_kiwi --host.connection_time_s=7200 >> "$HOME/lekiwi_host.log" 2>&1
+      --robot.id=my_awesome_kiwi --host.connection_time_s=7200 >> "$HOME/lekiwi_host.log" 2>&1 9>&-
   echo "[keepalive] $(date +%F' '%T) host 종료(코드 $?) — 3초 후 재기동" >> "$HOME/lekiwi_host.log"
   sleep 3
 done
@@ -469,7 +490,8 @@ def ensure_jetson_host(args) -> bool:
         print(f"           ssh {args.jetson_user}@{args.jetson_ip} 키 인증이 되는지 확인하세요.")
         return False
 
-    # 기존 래퍼가 떠 있으면(포트는 아직 안 열린 과도기) 중복 기동하지 않는다.
+    # 중복 기동 방지는 래퍼 안의 flock 이 최종 방어선이다(경쟁 상태에서도 안전).
+    # 여기 pgrep 은 불필요한 프로세스 생성을 줄이는 1차 필터일 뿐이다.
     rc, out = _jetson_ssh(
         args,
         f"if pgrep -f '[l]ekiwi_host_keepalive.sh' > /dev/null; then echo already; else "
