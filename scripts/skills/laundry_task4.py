@@ -592,6 +592,26 @@ def local_preflight(args):
     print(f"  python : {py}{'' if os.path.exists(py) else '  ✗ 없음'}")
     ok &= os.path.exists(py)
 
+    # 폴딩 캠 3대: udev 이름(/dev/lerobot/camera_N)은 '물리 포트'로 붙는다. 카메라 4대가
+    # 2쌍씩 벤더·모델·시리얼이 완전히 같아 udev 단서가 포트뿐이기 때문이다. 자리를 옮기면
+    # 이름이 뒤바뀐다(2026-08-05: 폴딩 top 이 세탁기 상공캠을 가리킨 채로 돌았다).
+    # 매 실행마다 모델+화면내용으로 다시 배정해 ~/.lerobot/cams/ 링크를 갱신한다.
+    if not args.no_cam_resolve:
+        try:
+            sys.path.insert(0, str(REPO / "examples" / "lekiwi"))
+            from resolve_cameras import resolve as _resolve_cams, write_links as _write_cam_links
+            mapping, _cams, _why = _resolve_cams(verbose=False)
+            need = ("top", "left_cam", "right_cam")
+            if all(k in mapping for k in need):
+                _write_cam_links(mapping)
+                print("  폴딩캠 : " + "  ".join(
+                    f"{k}→{os.path.basename(mapping[k])}" for k in need))
+            else:
+                print(f"  폴딩캠 : ⚠️ 배정 실패({', '.join(w for w in _why if '⚠️' in w) or '카메라 부족'})"
+                      " — 기존 /dev/lerobot/camera_N 으로 진행")
+        except Exception as e:
+            print(f"  폴딩캠 : ⚠️ 자동 배정 건너뜀({type(e).__name__}: {e}) — 기존 경로 사용")
+
     # 상공캠: 번호(/dev/videoN)는 본체마다·재연결마다 바뀌므로 실제로 프레임이 나오는 노드를 찾는다.
     print(f"  상공캠 : 탐색 중 (지정={args.overhead_cam}"
           + (f", match='{args.overhead_match}'" if args.overhead_match else "") + ")")
@@ -686,6 +706,8 @@ def main():
                     help="lekiwi_host 자동 기동 안 함(이미 직접 띄운 경우)")
     ap.add_argument("--no-grip-regs", action="store_true",
                     help="6번 순응제어 레지스터(P게인·토크상한) 자동 설정 안 함")
+    ap.add_argument("--no-cam-resolve", action="store_true",
+                    help="폴딩 캠 자동 배정 안 함(udev 이름을 그대로 씀)")
     ap.add_argument("--handoff-motion", default=HANDOFF_MOTION,
                     help="마지막 후퇴 뒤 재생할 전달 모션 이름(motions/<이름>.json). 비우면 생략. env HANDOFF_MOTION")
     ap.add_argument("--check", action="store_true", help="preflight 만 하고 종료(로봇 안 움직임)")
