@@ -172,6 +172,31 @@ def resolve(verbose=True):
 ROLES = ("top", "left_cam", "right_cam", "overhead")
 
 
+def is_capture_node(dev: str) -> bool:
+    """캡처용 노드인지(=index 0) 확인한다.
+
+    카메라 한 대가 /dev/videoN 을 두 개 만든다: index 0 = 캡처, index 1 = 메타데이터.
+    USB 가 재열거되면 번호가 통째로 밀려서, 예전에 캡처 노드였던 번호가 다음번엔
+    메타데이터 노드가 된다. 파일은 '존재'하지만 열리지 않는다
+    (ConnectionError: could not be opened). 존재 확인만으로는 못 걸러낸다.
+    """
+    name = os.path.basename(dev)
+    idx = Path(f"/sys/class/video4linux/{name}/index")
+    return idx.exists() and idx.read_text().strip() == "0"
+
+
+def links_valid(roles=("top", "left_cam", "right_cam")) -> bool:
+    """기록해 둔 링크가 아직 유효한 캡처 노드를 가리키는지."""
+    for role in roles:
+        link = LINKS / role
+        if not link.is_symlink():
+            return False
+        target = os.path.realpath(link)
+        if not os.path.exists(target) or not is_capture_node(target):
+            return False
+    return True
+
+
 def write_links(result):
     """배정된 링크를 새로 만들고, 배정 못 한 역할의 '묵은 링크'는 지운다.
 

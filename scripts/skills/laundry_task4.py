@@ -49,6 +49,8 @@
 """
 
 import argparse
+import json
+import math
 import os
 import select
 import shlex
@@ -389,11 +391,15 @@ def preflight(args):
     where = "이 머신(로컬)" if csi_is_local(args) else args.csi_host
     print(f"[A] preflight: SO101 쪽 확인 — {where}")
 
-    # 폴딩 캠 배정은 LeKiwi 단계와 무관하다. 여기서 해야 --skip-task3(폴딩만)에서도 돈다.
-    # (처음엔 LeKiwi preflight 안에 뒀는데, --skip-task3 면 그게 통째로 건너뛰어져서
-    #  카메라가 배정되지 않은 채 폴딩이 시작됐다.)
+    # 순서가 중요하다: 팔을 기준 자세로 먼저 세운 뒤에 카메라를 배정한다.
+    # 좌/우 팔캠 구분은 '화면에 접는 판이 어느 쪽으로 보이는지'로 하는데, 팔이 제멋대로
+    # 있으면 그 화면이 달라져 배정이 흔들린다. 자세를 고정해 놓고 봐야 재현된다.
+    # 실패하면 preflight 를 통과시키지 않는다 — Enter 를 받기 전에 멈춰야
+    # '수건은 전달됐는데 폴딩이 안 되는' 상황을 피할 수 있다.
+    pre_ok = True
     if csi_is_local(args):
-        resolve_folding_cams(args)
+        pre_ok &= home_arms(args)
+        pre_ok &= resolve_folding_cams(args)
 
     if csi_is_local(args):
         # SSH 를 돌 이유가 없다. 같은 것들을 로컬에서 직접 확인한다.
@@ -413,6 +419,9 @@ def preflight(args):
             print(f"  | dev  : {p}{'' if p.exists() else '  ✗ 없음(99-lerobot.rules 필요)'}")
             ok &= p.exists()
         if ok:
+            if not pre_ok:
+                print("  ✗ preflight 실패 — 홈 자세/카메라 배정 확인")
+                return False
             print("  ✅ preflight OK")
         else:
             print("  ✗ preflight 실패 — 위 ✗ 항목 확인")
@@ -458,6 +467,29 @@ def _looks_like_motor_failure(lines) -> str:
     return ""
 
 
+def ensure_cams_valid(args, quiet=False):
+    """링크가 아직 유효한 캡처 노드를 가리키는지 확인하고, 아니면 다시 배정한다.
+
+    USB 가 재열거되면 /dev/videoN 번호가 통째로 밀린다. 그러면 예전에 캡처 노드였던
+    번호가 메타데이터 노드(index 1)가 되어, 파일은 있는데 열리지는 않는다. preflight
+    때 맞춰 놓아도 실제 실행 시점에 어긋날 수 있으므로, 띄우기 직전에 다시 확인한다.
+    """
+    if args.no_cam_resolve:
+        return True
+    try:
+        sys.path.insert(0, str(REPO / "examples" / "lekiwi"))
+        from resolve_cameras import links_valid
+        if links_valid():
+            return True
+        if not quiet:
+            print("  ⚠️ 카메라 링크가 무효해졌습니다(USB 재열거) — 다시 배정합니다")
+        return resolve_folding_cams(args)
+    except Exception as e:
+        if not quiet:
+            print(f"  ⚠️ 카메라 재확인 건너뜀({type(e).__name__}: {e})")
+        return True
+
+
 def _wait_cams_free(args, timeout=15.0):
     """폴딩 캠 3대가 다시 열리는 상태가 될 때까지 기다린다.
 
@@ -492,9 +524,10 @@ def run_csi(args):
         if attempt > 1:
             print(f"\n  ↻ 재시도 {attempt}/{args.csi_retries} — {args.csi_retry_delay:.0f}초 후 다시 로딩")
             time.sleep(args.csi_retry_delay)
-        # 앞 시도가 카메라를 놓을 때까지 기다린다. 안 그러면 재시도가 매번
-        # device busy 로 같은 자리에서 실패한다.
+        # 앞 시도가 카메라를 놓을 때까지 기다리고, 링크가 아직 유효한지도 확인한다.
+        # (USB 재열거로 /dev/videoN 번호가 밀리면 링크가 메타데이터 노드를 가리키게 된다)
         _wait_cams_free(args)
+        ensure_cams_valid(args)
         lines = []
         try:
             if local:
@@ -673,6 +706,66 @@ def ensure_jetson_host(args) -> bool:
     return False
 
 
+IDLE_POSTURE = "idle_posture.json"
+
+
+def home_arms(args):
+    """SO101 양팔을 기준 자세(idle_posture.json)로 세운다. 카메라 배정 '전에' 한다.
+
+    csi-agent 의 RobotHoming 은 clothing/idle_posture.json 을 찾는데 그 파일이 아예
+    없어서(2026-08-05 확인) 홈 복귀가 한 번도 돌지 않았다 — '팔이 제자리로 안 잡힌다'의 원인.
+    파일은 examples/lekiwi/record_idle_posture.py 로 만든다.
+
+    카메라를 열지 않는 SOFollower 를 직접 쓴다. setup_devices 의 robot 을 쓰면 카메라까지
+    함께 열려서, 자세를 잡기도 전에 카메라 문제로 실패한다.
+    """
+    if args.no_home:
+        return True
+    conf = Path(os.path.expanduser(args.csi_dir)) / "clothing" / IDLE_POSTURE
+    if not conf.exists():
+        print(f"  홈자세  : ⚠️ {IDLE_POSTURE} 없음 — 건너뜀 "
+              "(examples/lekiwi/record_idle_posture.py 로 현재 자세를 저장할 수 있습니다)")
+        return False
+    try:
+        target = json.loads(conf.read_text())["joint_positions"]
+    except Exception as e:
+        print(f"  홈자세  : ⚠️ {IDLE_POSTURE} 읽기 실패({e}) — 건너뜀")
+        return False
+
+    try:
+        sys.path.insert(0, str(REPO / "examples" / "lekiwi"))
+        from record_idle_posture import connect_with_retry, mk_arms
+    except Exception as e:
+        print(f"  홈자세  : ⚠️ 모듈 로드 실패({e}) — 건너뜀")
+        return False
+
+    print(f"  홈자세  : 양팔을 기준 자세로 이동 ({args.home_seconds:.1f}s)")
+    ok = True
+    for side, arm in mk_arms().items():
+        try:
+            connect_with_retry(arm, attempts=args.csi_retries, delay=3.0)
+            obs = arm.get_observation()
+            keys = [k for k in obs if k.endswith(".pos")]
+            start = {k: float(obs[k]) for k in keys}
+            goal = {k: float(target[f"{side}_{k}"]) for k in keys if f"{side}_{k}" in target}
+            n = max(1, int(args.home_seconds * 30))
+            for i in range(1, n + 1):
+                # 코사인 프로파일 — 시작/끝에서 부드럽게(csi-agent RobotHoming 과 동일한 방식)
+                t = (1.0 - math.cos(math.pi * i / n)) / 2.0
+                arm.send_action({k: start[k] + (goal[k] - start[k]) * t for k in goal})
+                time.sleep(1 / 30)
+            err = max(abs(float(arm.get_observation()[k]) - goal[k]) for k in goal)
+            print(f"           {side:<5} 도달 (최대 오차 {err:.1f})")
+            if err > 5.0:
+                print(f"           ⚠️ {side} 오차가 큽니다 — 걸림/과부하 확인")
+                ok = False
+            arm.disconnect()
+        except Exception as e:
+            print(f"           ✗ {side} 실패: {str(e).splitlines()[0][:110]}")
+            ok = False
+    return ok
+
+
 def resolve_folding_cams(args):
     """폴딩 캠 3대를 모델+화면내용으로 배정한다. LeKiwi 단계와 무관하므로
     --skip-task3(폴딩만 실행)에서도 반드시 돌아야 한다.
@@ -697,11 +790,15 @@ def resolve_folding_cams(args):
                 _wait_released([mapping[k] for k in need], timeout=15.0, verbose=False)
                 print("  폴딩캠 : " + "  ".join(
                     f"{k}→{os.path.basename(mapping[k])}" for k in need))
+                return True
             else:
                 print(f"  폴딩캠 : ⚠️ 배정 실패({', '.join(w for w in _why if '⚠️' in w) or '카메라 부족'})"
                       " — 기존 /dev/lerobot/camera_N 으로 진행")
+                return False
         except Exception as e:
             print(f"  폴딩캠 : ⚠️ 자동 배정 건너뜀({type(e).__name__}: {e}) — 기존 경로 사용")
+            return False
+    return True
 
 
 # ─────────────────────── [B] 로컬 task3 실행 ───────────────────────
@@ -810,6 +907,10 @@ def main():
                     help="6번 순응제어 레지스터(P게인·토크상한) 자동 설정 안 함")
     ap.add_argument("--no-cam-resolve", action="store_true",
                     help="폴딩 캠 자동 배정 안 함(udev 이름을 그대로 씀)")
+    ap.add_argument("--no-home", action="store_true",
+                    help="카메라 배정 전 양팔 홈 자세 이동을 건너뜀")
+    ap.add_argument("--home-seconds", type=float, default=float(os.environ.get("HOME_SECONDS", "3.0")),
+                    help="홈 자세로 이동하는 시간(초). env HOME_SECONDS")
     ap.add_argument("--csi-retries", type=int, default=int(os.environ.get("CSI_RETRIES", "10")),
                     help="모터 인식 실패 시 수건개기 프로세스를 다시 띄울 최대 횟수(기본 10). env CSI_RETRIES")
     ap.add_argument("--csi-retry-delay", type=float, default=float(os.environ.get("CSI_RETRY_DELAY", "5")),
