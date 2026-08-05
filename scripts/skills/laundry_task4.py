@@ -94,6 +94,7 @@ JETSON_USER = os.environ.get("JETSON_USER", "comnet02")
 USBNET_UNIT = os.environ.get("USBNET_UNIT", "lekiwi-usbnet.service")
 HOST_PORTS = (5555, 5556)
 GRIP_REGS_PY = "lekiwi_grip_regs.py"   # Jetson 홈에 두는 6번 순응 레지스터 설정 도구
+ARM_SPEED_PY = "lekiwi_arm_speed.py"   # 팔 1~6번 Goal_Velocity/Acceleration 설정 도구
 
 # Jetson 에 심어두는 host 자동 재기동 래퍼.
 #   host 는 클라이언트가 연결을 끊으면 함께 종료된다 → 매 실행마다 사람이 다시 띄워야 했다.
@@ -503,6 +504,31 @@ def ensure_grip_regs(args):
             print(f"           {ln}")
 
 
+def ensure_arm_speed(args):
+    """팔 1~6번의 Goal_Velocity/Acceleration 을 원본 play_motion 값(800/40)으로 맞춘다.
+
+    **왜 매번 해야 하나:** 둘 다 SRAM 이라 전원을 껐다 켜면 공장값(0/254)으로 돌아간다.
+    Goal_Velocity=0 은 '속도 무제한', Acceleration=254 는 거의 즉시 가속이라, 27.5Hz 로
+    들어오는 웨이포인트마다 모터가 튀어가 멈추고 다음 것까지 36ms 를 가만히 있는다
+    → 초당 27번 순간이동하는 꼴이라 뚝뚝 끊겨 보인다(FPS 가 낮아 보이는 현상의 정체).
+    800/40 은 속도에 상한을 둬서 다음 웨이포인트가 올 때까지 계속 이동 중이게 만든다.
+    host 가 버스를 점유하므로 host 기동 '전'에만 안전하다.
+    """
+    if args.no_grip_regs:
+        return
+    rc, out = _jetson_ssh(
+        args, f"~/miniforge3/envs/lerobot/bin/python ~/{ARM_SPEED_PY} --set 2>&1 | grep -v Warning",
+        timeout=60)
+    if rc != 0:
+        print(f"  팔속도  : ⚠️ 실패(rc={rc}) — 모션이 끊겨 보일 수 있음")
+        return
+    if "변경 없음" in out or "0개 레지스터" in out:
+        print("  팔속도  : Goal_Velocity=800 / Acceleration=40 이미 적용됨")
+    else:
+        print("  팔속도  : 팔 1~6번 Goal_Velocity=800 / Acceleration=40 적용 "
+              "(원본 play_motion 과 동일 — 웨이포인트 사이를 끊김 없이 이동)")
+
+
 def ensure_jetson_host(args) -> bool:
     """lekiwi_host 가 안 떠 있으면 Jetson 에 접속해 keepalive 래퍼로 띄운다."""
     if all(_port_open(args.jetson_ip, p) for p in HOST_PORTS):
@@ -512,6 +538,7 @@ def ensure_jetson_host(args) -> bool:
     print("  host   : 안 떠 있음 → Jetson 에서 기동")
     # 버스가 비어 있는 지금이 레지스터를 만질 수 있는 유일한 창이다(host 기동 전).
     ensure_grip_regs(args)
+    ensure_arm_speed(args)
     # 래퍼가 없거나 내용이 바뀌었으면 새로 심는다(멱등).
     rc, out = _jetson_ssh(args, f"cat > {KEEPALIVE_PATH} <<'__EOF__'\n{KEEPALIVE_SH}__EOF__\n"
                                 f"chmod +x {KEEPALIVE_PATH} && echo ok")
