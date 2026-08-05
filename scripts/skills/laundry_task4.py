@@ -93,6 +93,7 @@ HANDOFF_MOTION = os.environ.get("HANDOFF_MOTION", "")  # motions/<이름>.json, 
 JETSON_USER = os.environ.get("JETSON_USER", "comnet02")
 USBNET_UNIT = os.environ.get("USBNET_UNIT", "lekiwi-usbnet.service")
 HOST_PORTS = (5555, 5556)
+GRIP_REGS_PY = "lekiwi_grip_regs.py"   # Jetson 홈에 두는 6번 순응 레지스터 설정 도구
 
 # Jetson 에 심어두는 host 자동 재기동 래퍼.
 #   host 는 클라이언트가 연결을 끊으면 함께 종료된다 → 매 실행마다 사람이 다시 띄워야 했다.
@@ -475,6 +476,33 @@ def ensure_jetson_link(args) -> bool:
     return False
 
 
+def ensure_grip_regs(args):
+    """6번(gripper) 순응제어 레지스터를 보장한다. **host 가 안 떠 있을 때만** 호출할 것.
+
+    host 가 /dev/ttyACM0 를 점유하므로 동시 접근은 패킷이 섞여 위험하다. 반대로 host 기동
+    직전은 버스가 비어 있는 유일하게 안전한 창이라, 여기서 한 번 맞춰 둔다.
+    EEPROM 이라 값이 유지되고, 스크립트는 다를 때만 쓰므로 매번 불러도 마모가 없다.
+
+    P_Coefficient 가 핵심이다. 16 이면 손잡이에 막힌 위치오차에도 토크를 약하게 내
+    Torque_Limit 에 한참 못 미치는 데서 평형이 잡혀 그립이 약하다 → 당길 때 놓친다.
+    """
+    if args.no_grip_regs:
+        return
+    rc, out = _jetson_ssh(
+        args, f"~/miniforge3/envs/lerobot/bin/python ~/{GRIP_REGS_PY} --set 2>&1 | grep -v Warning",
+        timeout=40)
+    if rc != 0:
+        print(f"  그립설정: ⚠️ 실패(rc={rc}) — 순응제어는 위치제어만으로 동작 (치명적 아님)")
+        return
+    if "변경 없음" in out:
+        print("  그립설정: 6번 순응 레지스터 이미 맞음 (P게인/토크상한/과부하)")
+    else:
+        changed = [ln.strip() for ln in out.splitlines() if "→" in ln]
+        print(f"  그립설정: 6번 순응 레지스터 {len(changed)}개 조정")
+        for ln in changed:
+            print(f"           {ln}")
+
+
 def ensure_jetson_host(args) -> bool:
     """lekiwi_host 가 안 떠 있으면 Jetson 에 접속해 keepalive 래퍼로 띄운다."""
     if all(_port_open(args.jetson_ip, p) for p in HOST_PORTS):
@@ -482,6 +510,8 @@ def ensure_jetson_host(args) -> bool:
         return True
 
     print("  host   : 안 떠 있음 → Jetson 에서 기동")
+    # 버스가 비어 있는 지금이 레지스터를 만질 수 있는 유일한 창이다(host 기동 전).
+    ensure_grip_regs(args)
     # 래퍼가 없거나 내용이 바뀌었으면 새로 심는다(멱등).
     rc, out = _jetson_ssh(args, f"cat > {KEEPALIVE_PATH} <<'__EOF__'\n{KEEPALIVE_SH}__EOF__\n"
                                 f"chmod +x {KEEPALIVE_PATH} && echo ok")
@@ -615,6 +645,8 @@ def main():
                     help="USB 이더넷 정적 IP systemd unit — Jetson 이 ping 에 응답 안 할 때만 재시작. env USBNET_UNIT")
     ap.add_argument("--no-host-autostart", action="store_true",
                     help="lekiwi_host 자동 기동 안 함(이미 직접 띄운 경우)")
+    ap.add_argument("--no-grip-regs", action="store_true",
+                    help="6번 순응제어 레지스터(P게인·토크상한) 자동 설정 안 함")
     ap.add_argument("--handoff-motion", default=HANDOFF_MOTION,
                     help="마지막 후퇴 뒤 재생할 전달 모션 이름(motions/<이름>.json). 비우면 생략. env HANDOFF_MOTION")
     ap.add_argument("--check", action="store_true", help="preflight 만 하고 종료(로봇 안 움직임)")
