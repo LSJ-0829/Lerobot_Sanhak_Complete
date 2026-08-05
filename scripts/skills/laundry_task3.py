@@ -132,8 +132,14 @@ APPROACH_FULL_PX = float(os.environ.get("APPROACH_FULL_PX", "80"))
 Y_VEL_TO_CX = float(os.environ.get("Y_VEL_TO_CX", "+1"))
 # 실측: x.vel=+0.10 전진 시 cy 가 -11px 작아진다 → cy 를 줄이려면 x.vel 은 양수.
 X_VEL_TO_CY = float(os.environ.get("X_VEL_TO_CY", "-1"))
-# 전후진 허용오차(px). 4 는 너무 빡빡해서 한 STEP 이 그보다 크게 움직이면 영원히 진동한다.
-APPROACH_Y_TOL = float(os.environ.get("APPROACH_Y_TOL", "8"))
+# 전후진 허용오차(px). cy 는 작을수록 가깝다(실측: 전진 시 cy 감소).
+# 8 은 너무 넓었다 — 목표 17 일 때 cy 25 에서, 목표 22 일 때 cy 30 에서 '도착' 판정이 나
+# 문 열기에 닿지 않는 거리에 멈췄다(2026-08-05 실기). 4 로 좁혀 정지 구간을 절반으로 줄인다.
+# 예전 주석은 "4 는 너무 빡빡해 진동한다"였는데, 그건 오차와 무관하게 고정 스텝을 주던
+# 펄스 제어(_pulse) 시절 얘기다. 지금은 오차에 비례해 감속하는 연속 제어(_p_vel)라
+# 목표 근처에서 속도가 V_APPROACH_MIN 까지 떨어져 넘어가지 않는다.
+# 그래도 진동하면(cy 가 목표를 사이에 두고 왕복) 이 값을 6 정도로 되돌릴 것.
+APPROACH_Y_TOL = float(os.environ.get("APPROACH_Y_TOL", "4"))
 # 발산 감지: 최선 오차보다 이만큼(px) 더 나빠진 상태가 이 시간(초) 이상 지속되면 중단한다.
 DIVERGE_PX = float(os.environ.get("DIVERGE_PX", "60"))
 DIVERGE_SEC = float(os.environ.get("DIVERGE_SEC", "1.5"))
