@@ -840,6 +840,17 @@ def _model_paths(args):
 
 
 def check_models(args) -> bool:
+    if args.skip_models:
+        print("  모델    : 확인 건너뜀(--skip-models)")
+        return True
+    # csi-agent 가 통째로 없으면 train/ 아래를 하나씩 뒤져 봐야 전부 '없음'이다.
+    # 그 경우엔 경로를 나열하지 않고 한 줄로 끝낸다 — 진짜 문제는 '설치가 안 됐다'는 것 하나다.
+    cdir = Path(os.path.expanduser(args.csi_dir)) / "clothing"
+    if not cdir.is_dir():
+        print(f"  모델    : ⚠️ csi-agent 가 없습니다 ({args.csi_dir}) — 폴딩 모델 확인 건너뜀")
+        print("            폴딩까지 돌리려면 CSI_DIR 로 위치를 알려주거나 MIGRATION.md 대로 설치하세요.")
+        print("            LeKiwi 만 돌릴 거면 --skip-csi 를 쓰면 이 단계 자체가 안 돕니다.")
+        return True
     ok = True
     print("  모델    : 폴딩 정책/분류기 파일 확인")
     for label, d in _model_paths(args):
@@ -1117,6 +1128,10 @@ def main():
                     help="6번 순응제어 레지스터(P게인·토크상한) 자동 설정 안 함")
     ap.add_argument("--no-cam-resolve", action="store_true",
                     help="폴딩 캠 자동 배정 안 함(udev 이름을 그대로 씀)")
+    ap.add_argument("--skip-models", action="store_true",
+                    default=os.environ.get("SKIP_MODELS", "") not in ("", "0", "false"),
+                    help="폴딩 모델(train/ 아래 정책 4개+분류기) 확인을 건너뛴다. "
+                         "모델을 아직 안 옮긴 본체에서 나머지만 시험할 때. env SKIP_MODELS=1")
     ap.add_argument("--rulebased", action="store_true",
                     help="LeKiwi 집기를 VLA 대신 규칙기반으로(laundry_task2 방식: 녹화 모션 재생 + probe 판정 + 재시도). "
                          "SmolVLA 를 아예 로드하지 않아 GPU·체크포인트 문제를 통째로 피한다")
